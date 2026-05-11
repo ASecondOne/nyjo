@@ -1,0 +1,645 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Nyjo Control Room</title>
+  <style>
+    :root {
+      --bg: #f4efe7;
+      --ink: #1e2430;
+      --panel: rgba(255, 255, 255, 0.88);
+      --panel-strong: #fffdf8;
+      --muted: #6d7482;
+      --line: rgba(30, 36, 48, 0.12);
+      --accent: #0b7a75;
+      --accent-strong: #095e5a;
+      --warm: #c06f38;
+      --danger: #b5433f;
+      --success: #237551;
+      --shadow: 0 18px 60px rgba(25, 33, 51, 0.12);
+      --radius: 22px;
+    }
+
+    * {
+      box-sizing: border-box;
+    }
+
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      background:
+        radial-gradient(circle at top left, rgba(11, 122, 117, 0.14), transparent 30%),
+        radial-gradient(circle at top right, rgba(192, 111, 56, 0.18), transparent 28%),
+        linear-gradient(160deg, #f4efe7 0%, #ebe5dc 40%, #f7f4ee 100%);
+    }
+
+    .shell {
+      max-width: 1380px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+
+    .hero {
+      display: grid;
+      grid-template-columns: 1.5fr 1fr;
+      gap: 18px;
+      margin-bottom: 18px;
+    }
+
+    .card {
+      background: var(--panel);
+      border: 1px solid rgba(255, 255, 255, 0.72);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(12px);
+    }
+
+    .hero-card {
+      padding: 26px 28px;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hero-card::after {
+      content: "";
+      position: absolute;
+      inset: auto -20% -55% auto;
+      width: 260px;
+      height: 260px;
+      background: radial-gradient(circle, rgba(11, 122, 117, 0.12), transparent 68%);
+      pointer-events: none;
+    }
+
+    .eyebrow {
+      font-size: 12px;
+      letter-spacing: 0.16em;
+      text-transform: uppercase;
+      color: var(--muted);
+      margin-bottom: 12px;
+    }
+
+    h1 {
+      margin: 0 0 10px;
+      font-size: clamp(2rem, 4vw, 3.2rem);
+      line-height: 0.96;
+      letter-spacing: -0.04em;
+    }
+
+    .lede {
+      margin: 0;
+      max-width: 46rem;
+      color: var(--muted);
+      font-size: 1rem;
+      line-height: 1.5;
+    }
+
+    .hero-side {
+      padding: 26px 28px;
+      display: grid;
+      gap: 14px;
+      align-content: start;
+    }
+
+    .pill-row {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      border-radius: 999px;
+      padding: 9px 12px;
+      background: rgba(30, 36, 48, 0.06);
+      color: var(--ink);
+      font-size: 0.9rem;
+      font-weight: 600;
+    }
+
+    .pill::before {
+      content: "";
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: var(--muted);
+    }
+
+    .pill.live::before {
+      background: var(--success);
+      box-shadow: 0 0 0 8px rgba(35, 117, 81, 0.12);
+    }
+
+    .pill.busy::before {
+      background: var(--warm);
+      box-shadow: 0 0 0 8px rgba(192, 111, 56, 0.14);
+    }
+
+    .pill.dead::before {
+      background: var(--danger);
+      box-shadow: 0 0 0 8px rgba(181, 67, 63, 0.14);
+    }
+
+    .meta-grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    .meta-block {
+      padding: 12px 14px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.6);
+      border: 1px solid var(--line);
+    }
+
+    .meta-label {
+      font-size: 0.76rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+      margin-bottom: 6px;
+    }
+
+    .meta-value {
+      font-size: 0.96rem;
+      line-height: 1.35;
+      word-break: break-word;
+    }
+
+    .dashboard {
+      display: grid;
+      grid-template-columns: minmax(320px, 380px) minmax(360px, 1.1fr) minmax(320px, 0.9fr);
+      gap: 18px;
+    }
+
+    .panel {
+      padding: 22px;
+      min-height: 240px;
+    }
+
+    .panel h2 {
+      margin: 0 0 6px;
+      font-size: 1.06rem;
+      letter-spacing: -0.02em;
+    }
+
+    .panel-subtitle {
+      margin: 0 0 16px;
+      color: var(--muted);
+      font-size: 0.92rem;
+      line-height: 1.45;
+    }
+
+    .button-grid {
+      display: grid;
+      gap: 10px;
+    }
+
+    .button-row {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 10px;
+    }
+
+    button {
+      appearance: none;
+      border: none;
+      border-radius: 16px;
+      padding: 13px 14px;
+      background: var(--accent);
+      color: white;
+      font: inherit;
+      font-weight: 700;
+      cursor: pointer;
+      transition: transform 120ms ease, background 120ms ease, opacity 120ms ease;
+    }
+
+    button:hover:not(:disabled) {
+      transform: translateY(-1px);
+      background: var(--accent-strong);
+    }
+
+    button.secondary {
+      background: rgba(30, 36, 48, 0.08);
+      color: var(--ink);
+    }
+
+    button.warm {
+      background: var(--warm);
+    }
+
+    button.danger {
+      background: var(--danger);
+    }
+
+    button:disabled {
+      cursor: not-allowed;
+      opacity: 0.45;
+      transform: none;
+    }
+
+    .pre {
+      margin: 0;
+      border-radius: 18px;
+      padding: 16px;
+      min-height: 260px;
+      background: #171c24;
+      color: #eff3fb;
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+      overflow: auto;
+      font: 0.9rem/1.45 "IBM Plex Mono", "Cascadia Code", monospace;
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .stack {
+      display: grid;
+      gap: 18px;
+    }
+
+    .log-list {
+      display: grid;
+      gap: 10px;
+      max-height: 620px;
+      overflow: auto;
+    }
+
+    .log-entry {
+      padding: 12px 14px;
+      border-radius: 16px;
+      background: rgba(255, 255, 255, 0.68);
+      border: 1px solid var(--line);
+    }
+
+    .log-meta {
+      display: flex;
+      justify-content: space-between;
+      gap: 10px;
+      color: var(--muted);
+      font-size: 0.76rem;
+      margin-bottom: 6px;
+      text-transform: uppercase;
+      letter-spacing: 0.08em;
+    }
+
+    .log-entry.error {
+      border-color: rgba(181, 67, 63, 0.28);
+      background: rgba(181, 67, 63, 0.08);
+    }
+
+    .toast {
+      margin-top: 14px;
+      min-height: 1.4em;
+      color: var(--muted);
+      font-size: 0.92rem;
+    }
+
+    @media (max-width: 1180px) {
+      .dashboard {
+        grid-template-columns: 1fr;
+      }
+
+      .hero {
+        grid-template-columns: 1fr;
+      }
+    }
+  </style>
+</head>
+<body>
+  <div class="shell">
+    <section class="hero">
+      <article class="card hero-card">
+        <div class="eyebrow">Nyjo Control Room</div>
+        <h1>Browser-first sync control for the Studio bridge.</h1>
+        <p class="lede">
+          The Rust server is now the place to inspect local trees, queue Studio actions, review pull plans,
+          and watch bridge activity. Keep the Roblox plugin open as a thin executor inside Studio, and do the
+          rest from here.
+        </p>
+      </article>
+
+      <aside class="card hero-side">
+        <div class="pill-row">
+          <div id="bridge-pill" class="pill dead">Bridge offline</div>
+          <div id="command-pill" class="pill">Idle</div>
+        </div>
+        <div class="meta-grid">
+          <div class="meta-block">
+            <div class="meta-label">Version</div>
+            <div id="version-value" class="meta-value">unknown</div>
+          </div>
+          <div class="meta-block">
+            <div class="meta-label">Binding</div>
+            <div id="binding-value" class="meta-value">127.0.0.1</div>
+          </div>
+          <div class="meta-block">
+            <div class="meta-label">Project Root</div>
+            <div id="root-value" class="meta-value">loading…</div>
+          </div>
+          <div class="meta-block">
+            <div class="meta-label">Studio Place</div>
+            <div id="place-value" class="meta-value">not connected</div>
+          </div>
+        </div>
+      </aside>
+    </section>
+
+    <section class="dashboard">
+      <article class="card panel">
+        <h2>Controls</h2>
+        <p class="panel-subtitle">Local-only reads happen immediately. Studio operations are queued to the bridge plugin.</p>
+        <div class="button-grid">
+          <div class="button-row">
+            <button id="check-server" class="secondary">Check Server</button>
+            <button id="preview-tree" class="secondary">Preview Local Tree</button>
+          </div>
+          <div class="button-row">
+            <button id="push-studio">Queue Push To Studio</button>
+            <button id="preview-pull" class="secondary">Queue Preview Pull</button>
+          </div>
+          <div class="button-row">
+            <button id="apply-pull" class="warm">Queue Apply Pull</button>
+            <button id="force-pull" class="danger">Queue Force Pull</button>
+          </div>
+        </div>
+        <div class="toast" id="toast-line">Dashboard ready.</div>
+      </article>
+
+      <article class="card panel stack">
+        <div>
+          <h2>Output</h2>
+          <p class="panel-subtitle">Direct server reads and the latest tree preview show up here.</p>
+          <pre id="output-pane" class="pre">Open the Studio plugin to connect the bridge, then use the buttons here.</pre>
+        </div>
+        <div>
+          <h2>Last Studio Result</h2>
+          <p class="panel-subtitle">The last command completed by the Studio bridge appears here.</p>
+          <pre id="result-pane" class="pre">(no Studio command result yet)</pre>
+        </div>
+      </article>
+
+      <article class="card panel">
+        <h2>Activity Log</h2>
+        <p class="panel-subtitle">Queued commands, bridge activity, and errors are kept in a rolling local log.</p>
+        <div id="log-list" class="log-list"></div>
+      </article>
+    </section>
+  </div>
+
+  <script>
+    const bridgePill = document.getElementById("bridge-pill");
+    const commandPill = document.getElementById("command-pill");
+    const versionValue = document.getElementById("version-value");
+    const bindingValue = document.getElementById("binding-value");
+    const rootValue = document.getElementById("root-value");
+    const placeValue = document.getElementById("place-value");
+    const outputPane = document.getElementById("output-pane");
+    const resultPane = document.getElementById("result-pane");
+    const logList = document.getElementById("log-list");
+    const toastLine = document.getElementById("toast-line");
+    const studioButtons = [
+      document.getElementById("push-studio"),
+      document.getElementById("preview-pull"),
+      document.getElementById("apply-pull"),
+      document.getElementById("force-pull"),
+    ];
+
+    let lastDashboardState = null;
+
+    function setToast(message) {
+      toastLine.textContent = message;
+    }
+
+    function formatClock(timestampMs) {
+      if (!timestampMs) return "unknown";
+      return new Date(timestampMs).toLocaleTimeString();
+    }
+
+    function formatJson(value) {
+      return JSON.stringify(value, null, 2);
+    }
+
+    function formatTree(node, depth = 0, lines = [], limit = 140) {
+      if (!node || lines.length >= limit) return lines;
+      const indent = "  ".repeat(depth);
+      lines.push(`${indent}- ${node.name || "Unknown"} [${node.className || "Unknown"}]`);
+      if (Array.isArray(node.children)) {
+        for (const child of node.children) {
+          if (lines.length >= limit) break;
+          formatTree(child, depth + 1, lines, limit);
+        }
+      }
+      return lines;
+    }
+
+    async function api(path, options) {
+      const response = await fetch(path, {
+        ...options,
+        headers: {
+          "Content-Type": "application/json",
+          "Accept": "application/json",
+          ...(options && options.headers ? options.headers : {}),
+        },
+      });
+      const payload = await response.json();
+      if (!response.ok || !payload.ok) {
+        const message = payload && payload.error && payload.error.message
+          ? payload.error.message
+          : `HTTP ${response.status}`;
+        throw new Error(message);
+      }
+      return payload.data;
+    }
+
+    function renderLogs(logs) {
+      logList.innerHTML = "";
+      if (!Array.isArray(logs) || logs.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "log-entry";
+        empty.textContent = "No activity yet.";
+        logList.appendChild(empty);
+        return;
+      }
+
+      for (const entry of [...logs].reverse()) {
+        const el = document.createElement("article");
+        el.className = `log-entry ${entry.level === "error" ? "error" : ""}`;
+
+        const meta = document.createElement("div");
+        meta.className = "log-meta";
+        meta.innerHTML = `<span>${entry.level || "info"}</span><span>${formatClock(entry.timestampMs)}</span>`;
+
+        const body = document.createElement("div");
+        body.textContent = entry.message || "(empty log)";
+
+        el.append(meta, body);
+        logList.appendChild(el);
+      }
+    }
+
+    function renderDashboard(snapshot) {
+      lastDashboardState = snapshot;
+      const server = snapshot.server || {};
+      const plugin = snapshot.plugin || {};
+      const pending = plugin.pendingCommand;
+      const active = plugin.activeCommand;
+
+      versionValue.textContent = server.version || "unknown";
+      bindingValue.textContent = server.binding || "unknown";
+      rootValue.textContent = server.projectRoot || "unknown";
+      placeValue.textContent = plugin.placeName || "not connected";
+
+      if (plugin.connected) {
+        bridgePill.className = "pill live";
+        bridgePill.textContent = "Bridge connected";
+      } else {
+        bridgePill.className = "pill dead";
+        bridgePill.textContent = "Bridge offline";
+      }
+
+      if (active) {
+        commandPill.className = "pill busy";
+        commandPill.textContent = `Running #${active.id}: ${active.kind}`;
+      } else if (pending) {
+        commandPill.className = "pill busy";
+        commandPill.textContent = `Queued #${pending.id}: ${pending.kind}`;
+      } else {
+        commandPill.className = "pill";
+        commandPill.textContent = "Idle";
+      }
+
+      const canQueue = Boolean(plugin.connected) && !pending && !active;
+      for (const button of studioButtons) {
+        button.disabled = !canQueue;
+      }
+
+      if (snapshot.lastResult) {
+        const result = snapshot.lastResult;
+        const detailLines = [
+          `Command #${result.commandId} (${result.kind})`,
+          `Finished: ${formatClock(result.finishedAtMs)}`,
+          `OK: ${result.ok}`,
+          ``,
+          result.summary || "(no summary)",
+        ];
+        if (result.detail) {
+          detailLines.push("", result.detail);
+        }
+        if (result.data !== undefined && result.data !== null) {
+          detailLines.push("", formatJson(result.data));
+        }
+        resultPane.textContent = detailLines.join("\n");
+      }
+
+      renderLogs(snapshot.logs || []);
+    }
+
+    async function refreshDashboard() {
+      const snapshot = await api("/api/dashboard/state");
+      renderDashboard(snapshot);
+    }
+
+    async function checkServer() {
+      const info = await api("/api/info");
+      outputPane.textContent = [
+        `Version: ${info.version || "unknown"}`,
+        `Binding: ${info.binding || "unknown"}`,
+        `Project root: ${info.projectRoot || "unknown"}`,
+        ``,
+        `Capabilities`,
+        formatJson(info.capabilities || {}),
+        ``,
+        `Translated items`,
+        formatJson(info.translatedItems || {}),
+      ].join("\n");
+      setToast("Server info refreshed.");
+    }
+
+    async function previewTree() {
+      const data = await api("/api/tree");
+      const tree = data.tree;
+      const lines = formatTree(tree);
+      if (Array.isArray(tree && tree.children) && lines.length >= 140) {
+        lines.push("...");
+      }
+      outputPane.textContent = [
+        `Root: ${tree && tree.name ? tree.name : "unknown"}`,
+        `Class: ${tree && tree.className ? tree.className : "unknown"}`,
+        ``,
+        lines.join("\n"),
+      ].join("\n");
+      setToast("Local tree preview updated.");
+    }
+
+    async function queueStudioCommand(kind, label) {
+      const data = await api("/api/dashboard/command", {
+        method: "POST",
+        body: JSON.stringify({ kind }),
+      });
+      setToast(data.message || `Queued ${label}.`);
+      await refreshDashboard();
+    }
+
+    document.getElementById("check-server").addEventListener("click", () => {
+      checkServer().catch((error) => {
+        outputPane.textContent = `Check Server failed.\n\n${error.message}`;
+        setToast("Check Server failed.");
+      });
+    });
+
+    document.getElementById("preview-tree").addEventListener("click", () => {
+      previewTree().catch((error) => {
+        outputPane.textContent = `Preview Local Tree failed.\n\n${error.message}`;
+        setToast("Tree preview failed.");
+      });
+    });
+
+    document.getElementById("push-studio").addEventListener("click", () => {
+      queueStudioCommand("pushLocalTree", "push to Studio").catch((error) => {
+        setToast(error.message);
+      });
+    });
+
+    document.getElementById("preview-pull").addEventListener("click", () => {
+      queueStudioCommand("previewPull", "preview pull").catch((error) => {
+        setToast(error.message);
+      });
+    });
+
+    document.getElementById("apply-pull").addEventListener("click", () => {
+      queueStudioCommand("applyPull", "apply pull").catch((error) => {
+        setToast(error.message);
+      });
+    });
+
+    document.getElementById("force-pull").addEventListener("click", () => {
+      queueStudioCommand("forcePull", "force pull").catch((error) => {
+        setToast(error.message);
+      });
+    });
+
+    async function boot() {
+      try {
+        await Promise.all([checkServer(), refreshDashboard()]);
+      } catch (error) {
+        outputPane.textContent = `Dashboard boot failed.\n\n${error.message}`;
+        setToast("Waiting for server or Studio bridge.");
+      }
+
+      window.setInterval(() => {
+        refreshDashboard().catch((error) => {
+          setToast(`Dashboard refresh failed: ${error.message}`);
+        });
+      }, 1500);
+    }
+
+    boot();
+  </script>
+</body>
+</html>

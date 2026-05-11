@@ -1,0 +1,48 @@
+#compdef nyjo
+
+local -a _nyjo_commands
+_nyjo_commands=(
+  'init:initialize a nyjo project'
+  'install:package and install the Studio plugin'
+  'tree:print the parsed local project tree'
+  'serve:start the nyjo server and browser dashboard'
+  'doctor:summarize the local project structure'
+)
+
+_arguments -C \
+  '1:command:->command' \
+  '*::arg:->args'
+
+case $state in
+  command)
+    _describe -t commands 'nyjo command' _nyjo_commands
+    ;;
+  args)
+    case $words[2] in
+      init)
+        _arguments \
+          '--root=[project root]:root:_files -/' \
+          '--force[overwrite the default .nyjoignore if it already exists]'
+        ;;
+      install)
+        _arguments \
+          '--output-dir=[directory for the packaged plugin]:directory:_files -/' \
+          '--port=[port that the plugin should connect to]:port:_guard "[0-9]#" "port"'
+        ;;
+      tree)
+        _arguments \
+          '--root=[project root]:root:_files -/' \
+          '--json[print the parsed tree as JSON]'
+        ;;
+      serve)
+        _arguments \
+          '--root=[project root]:root:_files -/' \
+          '--port=[local port for the nyjo server and dashboard]:port:_guard "[0-9]#" "port"'
+        ;;
+      doctor)
+        _arguments \
+          '--root=[project root]:root:_files -/'
+        ;;
+    esac
+    ;;
+esac
