@@ -115,6 +115,7 @@ Embedded header convention:
   - `.server.lua`, `.client.lua`, `.lua`
   - `.part`, `.model`, `.worldmodel`
   - `.folder`, `.rf`, `.re`, `.bf`, `.be`
+- Fixed suffixes stay authoritative; headers and sidecar metadata can add properties, attributes, and tags but should not change a `.server.lua` into a different class.
 - The parser still accepts legacy sidecar `.meta.json` files for backward compatibility and as a fallback for directory-backed containers.
 
 Directory-backed script convention:

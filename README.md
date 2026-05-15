@@ -178,7 +178,11 @@ This header style is supported for:
 - `.part`, `.model`, `.worldmodel`
 - `.folder`, `.rf`, `.re`, `.bf`, `.be`
 
+The file suffix still stays authoritative. For example, `.server.lua` must remain a `Script`, `.re` must remain a `RemoteEvent`, and `.folder` must remain a `Folder`.
+
 Legacy `.meta.json` files still parse for compatibility, especially for directory-backed containers.
+
+If you need an arbitrary non-script class that does not have its own dedicated suffix, prefer `.instance.json` or a directory-backed node with legacy `.meta.json`.
 
 ### Directory-Backed Scripts
 

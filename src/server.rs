@@ -722,6 +722,7 @@ fn create_entry_impl(root: &Path, request: CreateRequest) -> Result<crate::model
                 .with_context(|| format!("failed to create directory {}", target.display()))?;
         }
         "file" => {
+            validate_fixed_target_metadata(&target, request.metadata.as_ref())?;
             if target.exists() && !request.overwrite {
                 bail!(
                     "{} already exists; set overwrite=true to replace it",
@@ -770,6 +771,7 @@ fn update_entry_impl(root: &Path, request: UpdateRequest) -> Result<crate::model
             write_metadata(&target, metadata)?;
         }
     } else if let Some(always_embed_header) = embedded_metadata_mode(&target) {
+        validate_fixed_target_metadata(&target, request.metadata.as_ref())?;
         write_embedded_entry_file(
             &target,
             request.contents,
@@ -777,6 +779,7 @@ fn update_entry_impl(root: &Path, request: UpdateRequest) -> Result<crate::model
             always_embed_header,
         )?;
     } else {
+        validate_fixed_target_metadata(&target, request.metadata.as_ref())?;
         if let Some(contents) = request.contents {
             fs::write(&target, contents)
                 .with_context(|| format!("failed to write file {}", target.display()))?;
@@ -1679,6 +1682,79 @@ fn embedded_metadata_mode(target: &Path) -> Option<bool> {
     None
 }
 
+fn fixed_target_class(target: &Path) -> Option<String> {
+    let file_name = target.file_name()?.to_str()?;
+
+    if file_name.ends_with(".server.lua") {
+        return Some("Script".to_string());
+    }
+    if file_name.ends_with(".client.lua") {
+        return Some("LocalScript".to_string());
+    }
+    if file_name.ends_with(".service.json") {
+        let service_name = file_name.strip_suffix(".service.json")?;
+        if service_name.is_empty() {
+            return None;
+        }
+        return Some(service_name.to_string());
+    }
+    if file_name.ends_with(".model.json") {
+        return Some("Model".to_string());
+    }
+    if file_name.ends_with(".part") {
+        return Some("Part".to_string());
+    }
+    if file_name.ends_with(".worldmodel") {
+        return Some("WorldModel".to_string());
+    }
+    if file_name.ends_with(".model") {
+        return Some("Model".to_string());
+    }
+    if file_name.ends_with(".folder") {
+        return Some("Folder".to_string());
+    }
+    if file_name.ends_with(".lua") {
+        return Some("ModuleScript".to_string());
+    }
+    if file_name.ends_with(".rf") {
+        return Some("RemoteFunction".to_string());
+    }
+    if file_name.ends_with(".re") {
+        return Some("RemoteEvent".to_string());
+    }
+    if file_name.ends_with(".bf") {
+        return Some("BindableFunction".to_string());
+    }
+    if file_name.ends_with(".be") {
+        return Some("BindableEvent".to_string());
+    }
+
+    None
+}
+
+fn validate_fixed_target_metadata(target: &Path, metadata: Option<&NodeMetadata>) -> Result<()> {
+    let Some(metadata) = metadata else {
+        return Ok(());
+    };
+    let Some(declared_class_name) = metadata.class_name.as_deref() else {
+        return Ok(());
+    };
+    let Some(expected_class_name) = fixed_target_class(target) else {
+        return Ok(());
+    };
+
+    if declared_class_name == expected_class_name {
+        return Ok(());
+    }
+
+    bail!(
+        "file {} has a fixed local shape and cannot declare className {}; expected {}",
+        target.display(),
+        declared_class_name,
+        expected_class_name
+    )
+}
+
 fn embedded_file_allows_body(target: &Path) -> bool {
     let Some(file_name) = target.file_name().and_then(|name| name.to_str()) else {
         return false;
@@ -1738,13 +1814,11 @@ fn write_embedded_entry_file(
 ) -> Result<()> {
     let mut existing_contents = String::new();
     let mut existing_metadata = None;
-    let mut had_header = false;
 
     if target.exists() {
         let raw_contents = fs::read_to_string(target)
             .with_context(|| format!("failed to read file {}", target.display()))?;
         let parsed_payload = read_embedded_text_payload(target, &raw_contents)?;
-        had_header = parsed_payload.has_header;
         existing_contents = parsed_payload.contents;
         existing_metadata = normalize_metadata(parsed_payload.metadata.unwrap_or_default());
     }
@@ -1761,11 +1835,17 @@ fn write_embedded_entry_file(
         );
     }
 
-    let metadata = metadata_override
-        .and_then(normalize_metadata)
-        .or(existing_metadata);
-    let rendered =
-        render_embedded_text_document(&contents, metadata, always_embed_header || had_header)?;
+    let metadata = match metadata_override {
+        Some(metadata) => normalize_metadata(metadata),
+        None => existing_metadata,
+    };
+    validate_fixed_target_metadata(target, metadata.as_ref())?;
+
+    let rendered = render_embedded_text_document(
+        &contents,
+        metadata.clone(),
+        always_embed_header || metadata.is_some(),
+    )?;
 
     fs::write(target, rendered)
         .with_context(|| format!("failed to write file {}", target.display()))?;
@@ -2197,6 +2277,85 @@ mod tests {
                 .join("ReplicatedStorage/Shared.meta.json")
                 .exists()
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn update_entry_can_clear_embedded_metadata_and_drop_header_for_script_files() -> Result<()> {
+        let dir = tempdir()?;
+        fs::create_dir_all(dir.path().join("ReplicatedStorage"))?;
+        fs::write(
+            dir.path().join("ReplicatedStorage/Shared.lua"),
+            r#"--!nyjo
+--HEADER
+--{
+--  "attributes": {
+--    "Tier": "Core"
+--  }
+--}
+--CONTENTS
+return 1"#,
+        )?;
+
+        update_entry_impl(
+            dir.path(),
+            UpdateRequest {
+                path: "ReplicatedStorage/Shared.lua".to_string(),
+                contents: Some("return 3".to_string()),
+                metadata: Some(NodeMetadata::default()),
+            },
+        )?;
+
+        let source = fs::read_to_string(dir.path().join("ReplicatedStorage/Shared.lua"))?;
+        assert_eq!(source, "return 3");
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_entry_rejects_mismatched_metadata_class_for_fixed_file_shape() -> Result<()> {
+        let dir = tempdir()?;
+        let error = create_entry_impl(
+            dir.path(),
+            CreateRequest {
+                path: "ServerScriptService/Boot.server.lua".to_string(),
+                node_type: Some("file".to_string()),
+                contents: Some("print('boot')".to_string()),
+                metadata: Some(NodeMetadata {
+                    class_name: Some("LocalScript".to_string()),
+                    properties: Default::default(),
+                    attributes: Default::default(),
+                    tags: vec![],
+                }),
+                overwrite: false,
+            },
+        )
+        .expect_err("expected mismatched class metadata to be rejected");
+
+        assert!(error.to_string().contains("fixed local shape"));
+        assert!(error.to_string().contains("expected Script"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn update_entry_rejects_body_contents_for_marker_files() -> Result<()> {
+        let dir = tempdir()?;
+        fs::create_dir_all(dir.path().join("ReplicatedStorage"))?;
+        fs::write(dir.path().join("ReplicatedStorage/Ping.re"), "")?;
+
+        let error = update_entry_impl(
+            dir.path(),
+            UpdateRequest {
+                path: "ReplicatedStorage/Ping.re".to_string(),
+                contents: Some("should fail".to_string()),
+                metadata: None,
+            },
+        )
+        .expect_err("expected marker file body write to fail");
+
+        assert!(error.to_string().contains("stores metadata only"));
 
         Ok(())
     }

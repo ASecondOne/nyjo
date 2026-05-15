@@ -307,6 +307,15 @@ impl ParseContext {
             node.apply_metadata(directory_metadata);
         }
 
+        if let Some((detected_class_name, source_file_name)) = source_file {
+            validate_fixed_directory_source_class(
+                path,
+                source_file_name,
+                &node.class_name,
+                detected_class_name,
+            )?;
+        }
+
         Ok(node)
     }
 
@@ -402,6 +411,10 @@ impl ParseContext {
             node.apply_metadata(metadata);
         }
 
+        if let Some(expected_class_name) = expected_fixed_class_for_file(spec, &node.name) {
+            validate_fixed_file_class(path, spec.suffix, &node.class_name, &expected_class_name)?;
+        }
+
         Ok(Some(node))
     }
 
@@ -468,10 +481,10 @@ fn load_file_metadata(file: &Path, base_name: &str) -> Result<Option<NodeMetadat
 
     let mut seen = HashSet::new();
     for candidate in candidates {
-        if seen.insert(candidate.clone()) {
-            if let Some(metadata) = load_metadata_path(&candidate)? {
-                return Ok(Some(metadata));
-            }
+        if seen.insert(candidate.clone())
+            && let Some(metadata) = load_metadata_path(&candidate)?
+        {
+            return Ok(Some(metadata));
         }
     }
 
@@ -750,6 +763,52 @@ fn extension_spec(file_name: &str) -> Option<&'static ExtensionSpec> {
         .find(|spec| file_name.ends_with(spec.suffix))
 }
 
+fn expected_fixed_class_for_file(spec: &ExtensionSpec, node_name: &str) -> Option<String> {
+    match spec.payload {
+        PayloadKind::InstanceJson => None,
+        PayloadKind::ServiceJson => Some(node_name.to_string()),
+        _ => Some(spec.default_class.to_string()),
+    }
+}
+
+fn validate_fixed_file_class(
+    path: &Path,
+    suffix: &str,
+    actual_class_name: &str,
+    expected_class_name: &str,
+) -> Result<()> {
+    if actual_class_name == expected_class_name {
+        return Ok(());
+    }
+
+    bail!(
+        "file {} uses fixed suffix {} and cannot declare className {}; expected {}",
+        path.display(),
+        suffix,
+        actual_class_name,
+        expected_class_name
+    )
+}
+
+fn validate_fixed_directory_source_class(
+    directory: &Path,
+    source_file_name: &str,
+    actual_class_name: &str,
+    expected_class_name: &str,
+) -> Result<()> {
+    if actual_class_name == expected_class_name {
+        return Ok(());
+    }
+
+    bail!(
+        "directory {} uses fixed script source {} and cannot declare className {}; expected {}",
+        directory.display(),
+        source_file_name,
+        actual_class_name,
+        expected_class_name
+    )
+}
+
 fn consume_line<'a>(input: &mut &'a str) -> Option<&'a str> {
     if input.is_empty() {
         return None;
@@ -807,16 +866,15 @@ fn detect_directory_source_file(
     directory: &Path,
     current_class_name: Option<&str>,
 ) -> Result<Option<(&'static str, &'static str)>> {
-    if let Some(class_name) = current_class_name {
-        if let Some((expected_class_name, source_file_name)) = DIRECTORY_SCRIPT_SOURCE_FILES
+    if let Some(class_name) = current_class_name
+        && let Some((expected_class_name, source_file_name)) = DIRECTORY_SCRIPT_SOURCE_FILES
             .iter()
             .find(|(expected_class_name, source_file_name)| {
                 *expected_class_name == class_name && directory.join(source_file_name).is_file()
             })
             .copied()
-        {
-            return Ok(Some((expected_class_name, source_file_name)));
-        }
+    {
+        return Ok(Some((expected_class_name, source_file_name)));
     }
 
     let matches = DIRECTORY_SCRIPT_SOURCE_FILES
@@ -867,14 +925,11 @@ fn file_name(path: &Path) -> Result<String> {
 
 fn relative_string(root: &Path, path: &Path) -> String {
     match path.strip_prefix(root) {
-        Ok(relative) => {
-            let joined = relative
-                .components()
-                .filter_map(|component| component.as_os_str().to_str())
-                .collect::<Vec<_>>()
-                .join("/");
-            joined
-        }
+        Ok(relative) => relative
+            .components()
+            .filter_map(|component| component.as_os_str().to_str())
+            .collect::<Vec<_>>()
+            .join("/"),
         Err(_) => path.display().to_string(),
     }
 }
@@ -1077,6 +1132,28 @@ print("boot")"#,
     }
 
     #[test]
+    fn rejects_mismatched_class_name_for_fixed_script_file() -> Result<()> {
+        let dir = tempdir()?;
+        write_file(
+            dir.path(),
+            "ServerScriptService/Boot.server.lua",
+            r#"--!nyjo
+--HEADER
+--{
+--  "className": "ModuleScript"
+--}
+--CONTENTS
+print("boot")"#,
+        )?;
+
+        let error = scan_project(dir.path()).expect_err("expected mismatched script class to fail");
+        assert!(error.to_string().contains("fixed suffix .server.lua"));
+        assert!(error.to_string().contains("expected Script"));
+
+        Ok(())
+    }
+
+    #[test]
     fn respects_ignore_rules_and_hidden_files() -> Result<()> {
         let dir = tempdir()?;
         write_file(dir.path(), ".nyjoignore", "Ignored/\n*.rf\n")?;
@@ -1099,12 +1176,11 @@ print("boot")"#,
     #[test]
     fn applies_metadata_overrides() -> Result<()> {
         let dir = tempdir()?;
-        write_file(dir.path(), "Workspace/Enemy.folder", "")?;
+        write_file(dir.path(), "Workspace/Enemy.part", "")?;
         write_file(
             dir.path(),
             "Workspace/Enemy.meta.json",
             r#"{
-  "className": "Part",
   "properties": { "Anchored": true, "Name": "EnemyPart" },
   "attributes": { "Damage": 10 },
   "tags": ["Enemy"]
@@ -1131,6 +1207,72 @@ print("boot")"#,
             Some(10)
         );
         assert_eq!(enemy.tags, vec!["Enemy"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn applies_legacy_directory_class_overrides() -> Result<()> {
+        let dir = tempdir()?;
+        write_file(
+            dir.path(),
+            "Workspace/Enemy/.meta.json",
+            r#"{
+  "className": "Part",
+  "properties": { "Anchored": true },
+  "attributes": { "Damage": 10 },
+  "tags": ["Enemy"]
+}"#,
+        )?;
+
+        let tree = scan_project(dir.path())?;
+        let workspace = child(&tree, "Workspace");
+        let enemy = child(workspace, "Enemy");
+
+        assert_eq!(enemy.class_name, "Part");
+        assert_eq!(
+            enemy
+                .properties
+                .get("Anchored")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            enemy
+                .attributes
+                .get("Damage")
+                .and_then(|value| value.as_i64()),
+            Some(10)
+        );
+        assert_eq!(enemy.tags, vec!["Enemy"]);
+
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_directory_backed_script_with_conflicting_metadata_class() -> Result<()> {
+        let dir = tempdir()?;
+        write_file(
+            dir.path(),
+            "ServerScriptService/Main/init.server.lua",
+            "print('main')",
+        )?;
+        write_file(
+            dir.path(),
+            "ServerScriptService/Main/.meta.json",
+            r#"{
+  "className": "LocalScript"
+}"#,
+        )?;
+
+        let error = scan_project(dir.path())
+            .expect_err("expected directory-backed script class mismatch to fail");
+        assert!(
+            error
+                .to_string()
+                .contains("fixed script source init.server.lua")
+        );
+        assert!(error.to_string().contains("expected Script"));
 
         Ok(())
     }
