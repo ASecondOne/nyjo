@@ -59,6 +59,7 @@ Implemented right now:
 - [x] Studio plugin install into Vinegar local plugin folders
 - [x] Studio preview and push from the plugin
 - [x] Studio plugin bridge polling for browser-queued commands
+- [x] Explicit Studio session targeting so multiple open places do not steal each other's commands
 - [x] First-pass Studio snapshot upload and Studio-to-local sync
 - [x] Studio pull preview/apply/force flow with changed-path reporting
 - [x] Pull-time local conflict blocking for files, directories, and metadata

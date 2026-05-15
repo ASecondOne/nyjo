@@ -8,6 +8,7 @@ local WIDGET_ID = "NyjoWidget"
 local SETTINGS_KEY_PORT = "nyjo_port"
 local DEFAULT_PORT = 34872
 local BRIDGE_VERSION = "nyjo-studio-bridge/1"
+local BRIDGE_SESSION_ID = HttpService:GenerateGUID(false)
 local MANAGED_ATTRIBUTE = "NyjoManagedBy"
 local MANAGED_VALUE = "nyjo"
 local PANEL_COLOR = Color3.fromRGB(28, 30, 36)
@@ -1151,8 +1152,10 @@ local function reportBridgeHeartbeat()
 	end
 
 	return tryPostJson("/api/plugin/heartbeat", {
+		sessionId = BRIDGE_SESSION_ID,
 		bridgeVersion = BRIDGE_VERSION,
 		placeName = game.Name,
+		placeId = game.PlaceId ~= 0 and game.PlaceId or nil,
 		status = heartbeatStatus,
 	})
 end
@@ -1160,6 +1163,7 @@ end
 local function reportBridgeCommandResult(commandId, ok, summary, detail, data)
 	tryPostJson("/api/plugin/command-result", {
 		commandId = commandId,
+		sessionId = BRIDGE_SESSION_ID,
 		ok = ok,
 		summary = summary,
 		detail = detail,
@@ -1205,7 +1209,9 @@ local function bridgePollOnce()
 	end
 
 	local ok, pollResponse = pcall(function()
-		return fetchJson("/api/plugin/poll")
+		return postJson("/api/plugin/poll", {
+			sessionId = BRIDGE_SESSION_ID,
+		})
 	end)
 	if not ok then
 		bridgeState.lastError = tostring(pollResponse)

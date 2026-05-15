@@ -209,9 +209,12 @@ The dashboard is meant to be the main control surface. It shows:
 
 - Server status
 - Studio bridge status
+- Connected Studio sessions and the currently selected target place
 - Last command result
 - Log output
 - Buttons for preview/push/pull-style actions
+
+If you have multiple Studio places open at the same time, Nyjo now requires you to select the exact target place in the dashboard before it will queue a Studio write or pull command.
 
 ## Studio Plugin Bridge
 
@@ -221,6 +224,8 @@ The Roblox Studio plugin is a local bridge, not the main source of truth. Its jo
 - Poll for commands
 - Send Studio-side snapshot data back
 - Run supported preview/apply operations
+
+Each open Studio window now gets its own bridge session id, so queued dashboard commands are delivered only to the selected place instead of whichever plugin window polls first.
 
 The local files and local parser remain the core model.
 

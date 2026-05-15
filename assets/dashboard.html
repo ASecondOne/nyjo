@@ -263,6 +263,47 @@
       gap: 18px;
     }
 
+    .session-list {
+      display: grid;
+      gap: 10px;
+      margin-bottom: 14px;
+      max-height: 280px;
+      overflow: auto;
+    }
+
+    .session-card {
+      text-align: left;
+      display: grid;
+      gap: 4px;
+      background: rgba(255, 255, 255, 0.78);
+      color: var(--ink);
+      border: 1px solid var(--line);
+    }
+
+    .session-card:hover:not(:disabled) {
+      background: rgba(255, 255, 255, 0.96);
+    }
+
+    .session-card.selected {
+      background: rgba(11, 122, 117, 0.14);
+      border-color: rgba(11, 122, 117, 0.34);
+    }
+
+    .session-card.dead {
+      opacity: 0.72;
+    }
+
+    .session-title {
+      font-size: 0.96rem;
+      font-weight: 700;
+    }
+
+    .session-meta {
+      color: var(--muted);
+      font-size: 0.82rem;
+      line-height: 1.35;
+    }
+
     .log-list {
       display: grid;
       gap: 10px;
@@ -336,14 +377,14 @@
           </div>
           <div class="meta-block">
             <div class="meta-label">Binding</div>
-            <div id="binding-value" class="meta-value">127.0.0.1</div>
+          <div id="binding-value" class="meta-value">127.0.0.1</div>
           </div>
           <div class="meta-block">
             <div class="meta-label">Project Root</div>
             <div id="root-value" class="meta-value">loading…</div>
           </div>
           <div class="meta-block">
-            <div class="meta-label">Studio Place</div>
+            <div class="meta-label">Studio Target</div>
             <div id="place-value" class="meta-value">not connected</div>
           </div>
         </div>
@@ -352,8 +393,14 @@
 
     <section class="dashboard">
       <article class="card panel">
-        <h2>Controls</h2>
-        <p class="panel-subtitle">Local-only reads happen immediately. Studio operations are queued to the bridge plugin.</p>
+        <h2>Target Place</h2>
+        <p class="panel-subtitle">If you have multiple Studio places open, pick the exact bridge session Nyjo should control before queuing a write or pull.</p>
+        <div id="session-list" class="session-list"></div>
+        <div class="button-row">
+          <button id="clear-target" class="secondary">Clear Target</button>
+        </div>
+        <h2 style="margin-top: 18px;">Controls</h2>
+        <p class="panel-subtitle">Local-only reads happen immediately. Studio operations are queued only for the selected Studio bridge target.</p>
         <div class="button-grid">
           <div class="button-row">
             <button id="check-server" class="secondary">Check Server</button>
@@ -401,6 +448,8 @@
     const placeValue = document.getElementById("place-value");
     const outputPane = document.getElementById("output-pane");
     const resultPane = document.getElementById("result-pane");
+    const sessionList = document.getElementById("session-list");
+    const clearTargetButton = document.getElementById("clear-target");
     const logList = document.getElementById("log-list");
     const toastLine = document.getElementById("toast-line");
     const studioButtons = [
@@ -423,6 +472,22 @@
 
     function formatJson(value) {
       return JSON.stringify(value, null, 2);
+    }
+
+    function formatSessionLabel(session) {
+      const placeName = session && session.placeName ? session.placeName : "Unknown place";
+      if (session && session.placeId) {
+        return `${placeName} • place ${session.placeId}`;
+      }
+      return `${placeName} • unpublished`;
+    }
+
+    function formatSessionTag(session) {
+      const sessionId = session && (session.sessionId || session.targetSessionId);
+      if (!sessionId) {
+        return "session unknown";
+      }
+      return `session ${sessionId.slice(0, 8)}`;
     }
 
     function formatTree(node, depth = 0, lines = [], limit = 140) {
@@ -483,21 +548,84 @@
       }
     }
 
+    async function selectSession(sessionId) {
+      const data = await api("/api/dashboard/select-session", {
+        method: "POST",
+        body: JSON.stringify({ sessionId }),
+      });
+      setToast(data.message || "Studio bridge target updated.");
+      await refreshDashboard();
+    }
+
+    function renderSessions(plugin) {
+      sessionList.innerHTML = "";
+      const sessions = Array.isArray(plugin.sessions) ? plugin.sessions : [];
+      if (sessions.length === 0) {
+        const empty = document.createElement("div");
+        empty.className = "log-entry";
+        empty.textContent = "Open the Nyjo plugin in the Studio place you want to control.";
+        sessionList.appendChild(empty);
+        return;
+      }
+
+      for (const session of sessions) {
+        const card = document.createElement("button");
+        card.type = "button";
+        card.className = `session-card secondary${session.selected ? " selected" : ""}${session.connected ? "" : " dead"}`;
+        card.addEventListener("click", () => {
+          selectSession(session.sessionId).catch((error) => {
+            setToast(error.message);
+          });
+        });
+
+        const title = document.createElement("div");
+        title.className = "session-title";
+        title.textContent = formatSessionLabel(session);
+
+        const status = document.createElement("div");
+        status.className = "session-meta";
+        const statusParts = [];
+        statusParts.push(session.connected ? "connected" : "offline");
+        if (session.status) statusParts.push(session.status);
+        if (session.selected) {
+          statusParts.push("selected");
+        } else if (plugin.targetSessionId === session.sessionId) {
+          statusParts.push("auto-target");
+        }
+        status.textContent = statusParts.join(" • ");
+
+        const meta = document.createElement("div");
+        meta.className = "session-meta";
+        meta.textContent = `${formatSessionTag(session)} • seen ${formatClock(session.lastSeenMs)}`;
+
+        card.append(title, status, meta);
+        sessionList.appendChild(card);
+      }
+    }
+
     function renderDashboard(snapshot) {
       lastDashboardState = snapshot;
       const server = snapshot.server || {};
       const plugin = snapshot.plugin || {};
+      const sessions = Array.isArray(plugin.sessions) ? plugin.sessions : [];
       const pending = plugin.pendingCommand;
       const active = plugin.activeCommand;
+      const targetSession = sessions.find((session) => session.sessionId === plugin.targetSessionId) || null;
 
       versionValue.textContent = server.version || "unknown";
       bindingValue.textContent = server.binding || "unknown";
       rootValue.textContent = server.projectRoot || "unknown";
-      placeValue.textContent = plugin.placeName || "not connected";
+      placeValue.textContent = targetSession
+        ? formatSessionLabel(targetSession)
+        : plugin.selectionRequired
+          ? "choose a target below"
+          : plugin.connected
+            ? "waiting for target"
+            : "not connected";
 
       if (plugin.connected) {
         bridgePill.className = "pill live";
-        bridgePill.textContent = "Bridge connected";
+        bridgePill.textContent = `Bridge live (${plugin.connectedSessions || 0})`;
       } else {
         bridgePill.className = "pill dead";
         bridgePill.textContent = "Bridge offline";
@@ -514,15 +642,19 @@
         commandPill.textContent = "Idle";
       }
 
-      const canQueue = Boolean(plugin.connected) && !pending && !active;
+      renderSessions(plugin);
+
+      const canQueue = Boolean(plugin.targetSessionId) && !pending && !active;
       for (const button of studioButtons) {
         button.disabled = !canQueue;
       }
+      clearTargetButton.disabled = !plugin.selectedSessionId;
 
       if (snapshot.lastResult) {
         const result = snapshot.lastResult;
         const detailLines = [
           `Command #${result.commandId} (${result.kind})`,
+          `Target: ${result.targetPlaceName || formatSessionTag(result)}`,
           `Finished: ${formatClock(result.finishedAtMs)}`,
           `OK: ${result.ok}`,
           ``,
@@ -620,6 +752,12 @@
 
     document.getElementById("force-pull").addEventListener("click", () => {
       queueStudioCommand("forcePull", "force pull").catch((error) => {
+        setToast(error.message);
+      });
+    });
+
+    clearTargetButton.addEventListener("click", () => {
+      selectSession(null).catch((error) => {
         setToast(error.message);
       });
     });

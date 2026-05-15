@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Component, Path, PathBuf};
@@ -58,18 +59,27 @@ const LOGICAL_NODE_FILE_SUFFIXES: &[&str] = &[
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
 const LOG_BUFFER_LIMIT: usize = 200;
 const PLUGIN_CONNECTION_TIMEOUT_MS: u64 = 5_000;
+const PLUGIN_SESSION_RETENTION_MS: u64 = 60_000;
 
 #[derive(Debug, Default)]
 struct DashboardState {
     next_command_id: u64,
     pending_command: Option<PluginCommandEnvelope>,
     active_command: Option<PluginCommandEnvelope>,
-    plugin_last_seen_ms: Option<u64>,
-    plugin_bridge_version: Option<String>,
-    plugin_place_name: Option<String>,
-    plugin_status: Option<String>,
+    sessions: BTreeMap<String, BridgeSessionRecord>,
+    selected_session_id: Option<String>,
     last_result: Option<PluginCommandResultRecord>,
     logs: Vec<DashboardLogEntry>,
+}
+
+#[derive(Debug, Clone)]
+struct BridgeSessionRecord {
+    session_id: String,
+    bridge_version: Option<String>,
+    place_name: Option<String>,
+    place_id: Option<u64>,
+    status: Option<String>,
+    last_seen_ms: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -87,6 +97,11 @@ struct PluginCommandEnvelope {
     id: u64,
     kind: PluginCommandKind,
     requested_at_ms: u64,
+    target_session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_place_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_place_id: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -102,6 +117,11 @@ struct DashboardLogEntry {
 struct PluginCommandResultRecord {
     command_id: u64,
     kind: PluginCommandKind,
+    target_session_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_place_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_place_id: Option<u64>,
     ok: bool,
     summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -115,10 +135,15 @@ struct PluginCommandResultRecord {
 #[serde(rename_all = "camelCase")]
 struct DashboardPluginSnapshot {
     connected: bool,
+    connected_sessions: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    selected_session_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    target_session_id: Option<String>,
+    selection_required: bool,
+    sessions: Vec<DashboardBridgeSessionSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bridge_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    place_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     status: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -127,6 +152,23 @@ struct DashboardPluginSnapshot {
     pending_command: Option<PluginCommandEnvelope>,
     #[serde(skip_serializing_if = "Option::is_none")]
     active_command: Option<PluginCommandEnvelope>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardBridgeSessionSnapshot {
+    session_id: String,
+    connected: bool,
+    selected: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    bridge_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    place_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    place_id: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    status: Option<String>,
+    last_seen_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -143,23 +185,42 @@ struct DashboardSnapshot {
 #[serde(rename_all = "camelCase")]
 struct DashboardCommandRequest {
     kind: PluginCommandKind,
+    #[serde(default)]
+    target_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct DashboardSelectSessionRequest {
+    #[serde(default)]
+    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct PluginHeartbeatRequest {
+    session_id: String,
     #[serde(default)]
     bridge_version: Option<String>,
     #[serde(default)]
     place_name: Option<String>,
+    #[serde(default)]
+    place_id: Option<u64>,
     #[serde(default)]
     status: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
+struct PluginPollRequest {
+    session_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct PluginCommandResultRequest {
     command_id: u64,
+    session_id: String,
     ok: bool,
     summary: String,
     #[serde(default)]
@@ -319,8 +380,33 @@ impl PluginCommandKind {
     }
 }
 
+impl BridgeSessionRecord {
+    fn connected(&self) -> bool {
+        now_ms().saturating_sub(self.last_seen_ms) <= PLUGIN_CONNECTION_TIMEOUT_MS
+    }
+
+    fn label(&self) -> String {
+        let place = self
+            .place_name
+            .clone()
+            .unwrap_or_else(|| "unknown place".to_string());
+        match self.place_id {
+            Some(place_id) => format!(
+                "{place} (place {place_id}, session {})",
+                short_session_id(&self.session_id)
+            ),
+            None => format!("{place} (session {})", short_session_id(&self.session_id)),
+        }
+    }
+}
+
 impl DashboardState {
-    fn queue_command(&mut self, kind: PluginCommandKind) -> Result<PluginCommandEnvelope> {
+    fn queue_command(
+        &mut self,
+        kind: PluginCommandKind,
+        requested_target_session_id: Option<&str>,
+    ) -> Result<PluginCommandEnvelope> {
+        self.prune_sessions();
         if !self.plugin_connected() {
             bail!("Studio bridge is not connected; open the Nyjo plugin in Studio first");
         }
@@ -341,57 +427,97 @@ impl DashboardState {
             );
         }
 
+        let target_session_id = self.resolve_target_session_id(requested_target_session_id)?;
+        let target_session = self.sessions.get(&target_session_id).with_context(|| {
+            format!("target Studio bridge session {target_session_id} was not found")
+        })?;
+        let target_session_label = target_session.label();
+        let target_place_name = target_session.place_name.clone();
+        let target_place_id = target_session.place_id;
+
         self.next_command_id += 1;
         let command = PluginCommandEnvelope {
             id: self.next_command_id,
             kind,
             requested_at_ms: now_ms(),
+            target_session_id,
+            target_place_name,
+            target_place_id,
         };
         self.log(
             "info",
-            format!("Queued command #{}: {}", command.id, kind.label()),
+            format!(
+                "Queued command #{}: {} -> {}",
+                command.id,
+                kind.label(),
+                target_session_label
+            ),
         );
         self.pending_command = Some(command.clone());
         Ok(command)
     }
 
-    fn take_pending_command(&mut self) -> Option<PluginCommandEnvelope> {
+    fn take_pending_command(&mut self, session_id: &str) -> Option<PluginCommandEnvelope> {
+        self.prune_sessions();
         if self.active_command.is_some() {
+            return None;
+        }
+
+        if self
+            .pending_command
+            .as_ref()
+            .is_none_or(|command| command.target_session_id != session_id)
+        {
             return None;
         }
 
         let command = self.pending_command.take()?;
         self.log(
             "info",
-            format!("Dispatched command #{} to Studio bridge", command.id),
+            format!(
+                "Dispatched command #{} to {}",
+                command.id,
+                self.describe_command_target(&command)
+            ),
         );
         self.active_command = Some(command.clone());
         Some(command)
     }
 
     fn update_plugin_heartbeat(&mut self, heartbeat: PluginHeartbeatRequest) {
-        let was_connected = self.plugin_connected();
-        self.plugin_last_seen_ms = Some(now_ms());
-        self.plugin_bridge_version = heartbeat.bridge_version;
-        self.plugin_place_name = heartbeat.place_name;
-        self.plugin_status = heartbeat.status;
+        self.prune_sessions();
+        let session_id = heartbeat.session_id;
+        let was_connected = self
+            .sessions
+            .get(&session_id)
+            .is_some_and(BridgeSessionRecord::connected);
+        let record = BridgeSessionRecord {
+            session_id: session_id.clone(),
+            bridge_version: heartbeat.bridge_version,
+            place_name: heartbeat.place_name,
+            place_id: heartbeat.place_id,
+            status: heartbeat.status,
+            last_seen_ms: now_ms(),
+        };
 
         if !was_connected {
-            let place = self
-                .plugin_place_name
-                .clone()
-                .unwrap_or_else(|| "unknown place".to_string());
-            self.log("info", format!("Studio bridge connected from {place}"));
+            self.log(
+                "info",
+                format!("Studio bridge connected from {}", record.label()),
+            );
         }
+
+        self.sessions.insert(session_id, record);
     }
 
     fn finish_command(
         &mut self,
         result: PluginCommandResultRequest,
     ) -> Result<PluginCommandResultRecord> {
+        self.prune_sessions();
         let active = self
             .active_command
-            .take()
+            .as_ref()
             .with_context(|| "no active Studio bridge command to finish")?;
 
         if active.id != result.command_id {
@@ -402,9 +528,26 @@ impl DashboardState {
             );
         }
 
+        if active.target_session_id != result.session_id {
+            bail!(
+                "received result from session {} but active command #{} belongs to session {}",
+                result.session_id,
+                active.id,
+                active.target_session_id
+            );
+        }
+
+        let active = self
+            .active_command
+            .take()
+            .with_context(|| "no active Studio bridge command to finish")?;
+
         let record = PluginCommandResultRecord {
             command_id: result.command_id,
             kind: active.kind,
+            target_session_id: active.target_session_id.clone(),
+            target_place_name: active.target_place_name.clone(),
+            target_place_id: active.target_place_id,
             ok: result.ok,
             summary: result.summary,
             detail: result.detail,
@@ -416,9 +559,10 @@ impl DashboardState {
         self.log(
             level,
             format!(
-                "Studio bridge finished command #{} ({}): {}",
+                "Studio bridge finished command #{} ({}) on {}: {}",
                 record.command_id,
                 record.kind.label(),
+                self.describe_result_target(&record),
                 record.summary
             ),
         );
@@ -427,6 +571,36 @@ impl DashboardState {
     }
 
     fn snapshot(&self, root: &Path) -> DashboardSnapshot {
+        let mut sessions: Vec<_> = self
+            .sessions
+            .values()
+            .map(|session| DashboardBridgeSessionSnapshot {
+                session_id: session.session_id.clone(),
+                connected: session.connected(),
+                selected: self.selected_session_id.as_deref() == Some(session.session_id.as_str()),
+                bridge_version: session.bridge_version.clone(),
+                place_name: session.place_name.clone(),
+                place_id: session.place_id,
+                status: session.status.clone(),
+                last_seen_ms: session.last_seen_ms,
+            })
+            .collect();
+        sessions.sort_by(|left, right| {
+            right
+                .connected
+                .cmp(&left.connected)
+                .then_with(|| right.last_seen_ms.cmp(&left.last_seen_ms))
+                .then_with(|| left.place_name.cmp(&right.place_name))
+                .then_with(|| left.session_id.cmp(&right.session_id))
+        });
+
+        let connected_sessions = sessions.iter().filter(|session| session.connected).count();
+        let target_session_id = self.resolved_target_session_id();
+        let selected_session = self
+            .selected_session_id
+            .as_deref()
+            .and_then(|session_id| self.sessions.get(session_id));
+
         DashboardSnapshot {
             server: json!({
                 "version": env!("CARGO_PKG_VERSION"),
@@ -436,10 +610,15 @@ impl DashboardState {
             }),
             plugin: DashboardPluginSnapshot {
                 connected: self.plugin_connected(),
-                bridge_version: self.plugin_bridge_version.clone(),
-                place_name: self.plugin_place_name.clone(),
-                status: self.plugin_status.clone(),
-                last_seen_ms: self.plugin_last_seen_ms,
+                connected_sessions,
+                selected_session_id: self.selected_session_id.clone(),
+                target_session_id,
+                selection_required: connected_sessions > 1
+                    && self.resolved_target_session_id().is_none(),
+                sessions,
+                bridge_version: selected_session.and_then(|session| session.bridge_version.clone()),
+                status: selected_session.and_then(|session| session.status.clone()),
+                last_seen_ms: selected_session.map(|session| session.last_seen_ms),
                 pending_command: self.pending_command.clone(),
                 active_command: self.active_command.clone(),
             },
@@ -449,9 +628,129 @@ impl DashboardState {
     }
 
     fn plugin_connected(&self) -> bool {
-        self.plugin_last_seen_ms.is_some_and(|timestamp| {
-            now_ms().saturating_sub(timestamp) <= PLUGIN_CONNECTION_TIMEOUT_MS
-        })
+        self.sessions.values().any(BridgeSessionRecord::connected)
+    }
+
+    fn set_selected_session(&mut self, session_id: Option<String>) -> Result<()> {
+        self.prune_sessions();
+        match session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(session_id) => {
+                let session = self
+                    .sessions
+                    .get(session_id)
+                    .with_context(|| format!("Studio bridge session {session_id} was not found"))?;
+                let session_label = session.label();
+                self.selected_session_id = Some(session_id.to_string());
+                self.log(
+                    "info",
+                    format!("Selected Studio bridge target: {session_label}"),
+                );
+            }
+            None => {
+                self.selected_session_id = None;
+                self.log("info", "Cleared Studio bridge target selection".to_string());
+            }
+        }
+        Ok(())
+    }
+
+    fn resolve_target_session_id(&self, requested: Option<&str>) -> Result<String> {
+        if let Some(session_id) = requested
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or(self.selected_session_id.as_deref())
+        {
+            let session = self
+                .sessions
+                .get(session_id)
+                .with_context(|| format!("Studio bridge session {session_id} was not found"))?;
+            if !session.connected() {
+                bail!("selected Studio bridge session is offline; choose another connected place");
+            }
+            return Ok(session_id.to_string());
+        }
+
+        let mut connected = self
+            .sessions
+            .values()
+            .filter(|session| session.connected())
+            .map(|session| session.session_id.as_str());
+        let first = connected.next();
+        let second = connected.next();
+        match (first, second) {
+            (Some(session_id), None) => Ok(session_id.to_string()),
+            (Some(_), Some(_)) => {
+                bail!(
+                    "multiple Studio places are connected; choose a target place in the dashboard first"
+                )
+            }
+            _ => bail!("Studio bridge is not connected; open the Nyjo plugin in Studio first"),
+        }
+    }
+
+    fn resolved_target_session_id(&self) -> Option<String> {
+        self.resolve_target_session_id(None).ok()
+    }
+
+    fn describe_command_target(&self, command: &PluginCommandEnvelope) -> String {
+        if let Some(place_name) = &command.target_place_name {
+            return match command.target_place_id {
+                Some(place_id) => format!(
+                    "{place_name} (place {place_id}, session {})",
+                    short_session_id(&command.target_session_id)
+                ),
+                None => format!(
+                    "{place_name} (session {})",
+                    short_session_id(&command.target_session_id)
+                ),
+            };
+        }
+
+        format!("session {}", short_session_id(&command.target_session_id))
+    }
+
+    fn describe_result_target(&self, result: &PluginCommandResultRecord) -> String {
+        if let Some(place_name) = &result.target_place_name {
+            return match result.target_place_id {
+                Some(place_id) => format!(
+                    "{place_name} (place {place_id}, session {})",
+                    short_session_id(&result.target_session_id)
+                ),
+                None => format!(
+                    "{place_name} (session {})",
+                    short_session_id(&result.target_session_id)
+                ),
+            };
+        }
+
+        format!("session {}", short_session_id(&result.target_session_id))
+    }
+
+    fn prune_sessions(&mut self) {
+        let cutoff = now_ms().saturating_sub(PLUGIN_SESSION_RETENTION_MS);
+        self.sessions.retain(|session_id, session| {
+            session.last_seen_ms >= cutoff
+                || self.selected_session_id.as_deref() == Some(session_id.as_str())
+                || self
+                    .pending_command
+                    .as_ref()
+                    .is_some_and(|command| command.target_session_id == *session_id)
+                || self
+                    .active_command
+                    .as_ref()
+                    .is_some_and(|command| command.target_session_id == *session_id)
+        });
+        if self
+            .selected_session_id
+            .as_deref()
+            .is_some_and(|session_id| !self.sessions.contains_key(session_id))
+        {
+            self.selected_session_id = None;
+        }
     }
 
     fn log(&mut self, level: &str, message: String) {
@@ -465,6 +764,10 @@ impl DashboardState {
             self.logs.drain(0..excess);
         }
     }
+}
+
+fn short_session_id(session_id: &str) -> &str {
+    session_id.get(..8).unwrap_or(session_id)
 }
 
 pub async fn serve(root: PathBuf, port: u16) -> Result<()> {
@@ -481,8 +784,12 @@ pub async fn serve(root: PathBuf, port: u16) -> Result<()> {
         .route("/api/info", get(info))
         .route("/api/dashboard/state", get(dashboard_state))
         .route("/api/dashboard/command", post(queue_dashboard_command))
+        .route(
+            "/api/dashboard/select-session",
+            post(select_dashboard_session),
+        )
         .route("/api/plugin/heartbeat", post(plugin_heartbeat))
-        .route("/api/plugin/poll", get(plugin_poll))
+        .route("/api/plugin/poll", post(plugin_poll))
         .route("/api/plugin/command-result", post(plugin_command_result))
         .with_state(AppState {
             root: root.clone(),
@@ -525,6 +832,7 @@ async fn info(State(state): State<AppState>) -> impl IntoResponse {
             "studioPullPreview": true,
             "studioPullApply": true,
             "studioPullForce": true,
+            "multiPlaceTargeting": true,
             "embeddedFileMetadata": true,
             "compactStudioPull": true
         },
@@ -582,7 +890,10 @@ async fn info(State(state): State<AppState>) -> impl IntoResponse {
 
 async fn dashboard_state(State(state): State<AppState>) -> impl IntoResponse {
     match state.dashboard.lock() {
-        Ok(dashboard) => success(json!(dashboard.snapshot(&state.root))),
+        Ok(mut dashboard) => {
+            dashboard.prune_sessions();
+            success(json!(dashboard.snapshot(&state.root)))
+        }
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
             anyhow::anyhow!("dashboard state lock was poisoned"),
@@ -595,13 +906,35 @@ async fn queue_dashboard_command(
     Json(request): Json<DashboardCommandRequest>,
 ) -> impl IntoResponse {
     match state.dashboard.lock() {
-        Ok(mut dashboard) => match dashboard.queue_command(request.kind) {
-            Ok(command) => success(json!({
-                "queued": true,
-                "command": command,
-                "message": format!("Queued {}", request.kind.label())
+        Ok(mut dashboard) => {
+            match dashboard.queue_command(request.kind, request.target_session_id.as_deref()) {
+                Ok(command) => success(json!({
+                    "queued": true,
+                    "command": command,
+                    "message": format!("Queued {}", request.kind.label())
+                })),
+                Err(error) => error_response(StatusCode::CONFLICT, error),
+            }
+        }
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("dashboard state lock was poisoned"),
+        ),
+    }
+}
+
+async fn select_dashboard_session(
+    State(state): State<AppState>,
+    Json(request): Json<DashboardSelectSessionRequest>,
+) -> impl IntoResponse {
+    match state.dashboard.lock() {
+        Ok(mut dashboard) => match dashboard.set_selected_session(request.session_id) {
+            Ok(()) => success(json!({
+                "selected": true,
+                "selectedSessionId": dashboard.selected_session_id.clone(),
+                "message": "Studio bridge target updated"
             })),
-            Err(error) => error_response(StatusCode::CONFLICT, error),
+            Err(error) => error_response(StatusCode::BAD_REQUEST, error),
         },
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -629,10 +962,13 @@ async fn plugin_heartbeat(
     }
 }
 
-async fn plugin_poll(State(state): State<AppState>) -> impl IntoResponse {
+async fn plugin_poll(
+    State(state): State<AppState>,
+    Json(request): Json<PluginPollRequest>,
+) -> impl IntoResponse {
     match state.dashboard.lock() {
         Ok(mut dashboard) => success(json!({
-            "command": dashboard.take_pending_command()
+            "command": dashboard.take_pending_command(&request.session_id)
         })),
         Err(_) => error_response(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2454,33 +2790,65 @@ return 1"#,
     fn dashboard_rejects_commands_without_bridge_heartbeat() {
         let mut dashboard = DashboardState::default();
         let error = dashboard
-            .queue_command(PluginCommandKind::PushLocalTree)
+            .queue_command(PluginCommandKind::PushLocalTree, None)
             .expect_err("expected disconnected bridge to reject commands");
         assert!(error.to_string().contains("not connected"));
+    }
+
+    #[test]
+    fn dashboard_requires_selection_when_multiple_places_are_connected() {
+        let mut dashboard = DashboardState::default();
+        dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
+            session_id: "session-a".to_string(),
+            bridge_version: Some("test-bridge".to_string()),
+            place_name: Some("PlaceA".to_string()),
+            status: Some("idle".to_string()),
+            place_id: Some(101),
+        });
+        dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
+            session_id: "session-b".to_string(),
+            bridge_version: Some("test-bridge".to_string()),
+            place_name: Some("PlaceB".to_string()),
+            status: Some("idle".to_string()),
+            place_id: Some(202),
+        });
+
+        let error = dashboard
+            .queue_command(PluginCommandKind::PreviewPull, None)
+            .expect_err("expected multi-place bridge to require target selection");
+        assert!(
+            error
+                .to_string()
+                .contains("multiple Studio places are connected")
+        );
     }
 
     #[test]
     fn dashboard_command_lifecycle_moves_from_pending_to_result() -> Result<()> {
         let mut dashboard = DashboardState::default();
         dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
+            session_id: "session-a".to_string(),
             bridge_version: Some("test-bridge".to_string()),
             place_name: Some("UnitTest".to_string()),
             status: Some("idle".to_string()),
+            place_id: Some(101),
         });
 
-        let queued = dashboard.queue_command(PluginCommandKind::PreviewPull)?;
+        let queued = dashboard.queue_command(PluginCommandKind::PreviewPull, None)?;
         assert_eq!(queued.id, 1);
         assert!(dashboard.pending_command.is_some());
 
         let dispatched = dashboard
-            .take_pending_command()
+            .take_pending_command("session-a")
             .expect("expected pending command to dispatch");
         assert_eq!(dispatched.id, queued.id);
+        assert_eq!(dispatched.target_session_id, "session-a");
         assert!(dashboard.pending_command.is_none());
         assert!(dashboard.active_command.is_some());
 
         let result = dashboard.finish_command(PluginCommandResultRequest {
             command_id: dispatched.id,
+            session_id: "session-a".to_string(),
             ok: true,
             summary: "Preview ready".to_string(),
             detail: Some("No conflicts".to_string()),
@@ -2495,6 +2863,51 @@ return 1"#,
         );
         assert!(!dashboard.logs.is_empty());
 
+        Ok(())
+    }
+
+    #[test]
+    fn dashboard_only_dispatches_to_the_target_session() -> Result<()> {
+        let mut dashboard = DashboardState::default();
+        dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
+            session_id: "session-a".to_string(),
+            bridge_version: Some("test-bridge".to_string()),
+            place_name: Some("PlaceA".to_string()),
+            status: Some("idle".to_string()),
+            place_id: Some(101),
+        });
+        dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
+            session_id: "session-b".to_string(),
+            bridge_version: Some("test-bridge".to_string()),
+            place_name: Some("PlaceB".to_string()),
+            status: Some("idle".to_string()),
+            place_id: Some(202),
+        });
+
+        let queued =
+            dashboard.queue_command(PluginCommandKind::PushLocalTree, Some("session-b"))?;
+        assert!(dashboard.take_pending_command("session-a").is_none());
+
+        let dispatched = dashboard
+            .take_pending_command("session-b")
+            .expect("expected session-b to receive the queued command");
+        assert_eq!(dispatched.id, queued.id);
+        assert_eq!(dispatched.target_place_name.as_deref(), Some("PlaceB"));
+
+        let wrong_session = dashboard
+            .finish_command(PluginCommandResultRequest {
+                command_id: dispatched.id,
+                session_id: "session-a".to_string(),
+                ok: true,
+                summary: "wrong".to_string(),
+                detail: None,
+                data: None,
+            })
+            .expect_err("expected wrong session result to be rejected");
+        assert!(wrong_session.to_string().contains("belongs to session"));
+        assert!(dashboard.active_command.is_some());
+
+        assert!(dashboard.last_result.is_none());
         Ok(())
     }
 }
