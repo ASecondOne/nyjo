@@ -64,7 +64,9 @@ Implemented right now:
 - [x] Studio pull preview/apply/force flow with changed-path reporting
 - [x] Pull-time local conflict blocking for files, directories, and metadata
 - [x] Studio pull compaction into `.instance.json` fallback files for generic instance trees
+- [x] Typed fixed-shape files and typed container directories for common UI, value, and visual instances
 - [x] Typed property translation for common UI/layout/value/basepart cases
+- [x] Extra property translation for buttons plus `Decal` and `Texture`
 - [x] Zsh install/helper scripts for real `nyjo` CLI usage
 
 Still missing:
@@ -100,6 +102,11 @@ Current extension mapping:
 - `.part` -> `Part` with embedded header metadata plus optional compact JSON children
 - `.model` -> `Model` with embedded header metadata plus optional compact JSON children
 - `.worldmodel` -> `WorldModel` with embedded header metadata plus optional compact JSON children
+- `.screengui`, `.canvasgroup`, `.scrollingframe`, `.surfacegui`, `.billboardgui`
+- `.frame`, `.textbutton`, `.textlabel`, `.textbox`, `.imagelabel`, `.imagebutton`
+- `.uilistlayout`, `.uigridlayout`, `.uipadding`, `.uicorner`, `.uistroke`
+- `.texture`, `.decal`
+- `.stringvalue`, `.numbervalue`, `.intvalue`, `.boolvalue`, `.color3value`, `.vector3value`
 - `.folder` -> `Folder`
 - `.service.json` -> compact top-level service subtree file
 
@@ -133,6 +140,15 @@ Directory-backed script convention:
   - `init.client.lua`
   - `init.lua`
 
+Typed container directories:
+
+- Any supported fixed-shape non-script node can also be represented as a directory when it needs children.
+- Examples:
+  - `Spawn.part/.meta.json` plus nested children like `Surface.texture`
+  - `Hud.screengui/Play.textbutton/Corner.uicorner`
+- Directory metadata still uses `.meta.json`, while the directory name keeps the authoritative class suffix.
+- Studio subtrees with repeated child names fall back to compact `.instance.json` so duplicate children are not collapsed into one local path.
+
 Compact subtree convention:
 
 - If a subtree would otherwise explode into many tiny folders and metadata files, define it in one JSON file instead.
@@ -161,6 +177,8 @@ Likely default scaffold created by `nyjo init`:
 - `StarterGui/`
 - `StarterPlayer/StarterPlayerScripts/`
 - `StarterPlayer/StarterCharacterScripts/`
+- `Teams/`
+- `TextChatService/`
 - `Workspace/`
 - `SoundService/`
 - `Lighting/`
@@ -173,9 +191,10 @@ Structural items currently translated:
 - Local script files: `Script`, `LocalScript`, `ModuleScript`
 - Local marker files with embedded headers: `RemoteEvent`, `RemoteFunction`, `BindableEvent`, `BindableFunction`
 - Structured instance files with embedded headers: `Part`, `Model`, `WorldModel`, `Folder`
+- Typed fixed-shape files and directories for common UI, value, and visual instances
 - Directory-backed script containers with `init.server.lua`, `init.client.lua`, or `init.lua`
 - Compact subtree files: `.instance.json`, `.model.json`, `.service.json`
-- Generic compact fallback files via `.instance.json` for UI trees, value objects, and other non-script instance subtrees
+- Generic compact fallback files via `.instance.json` for unsupported or intentionally compact instance subtrees
 - Legacy directory-backed instances via `.meta.json` class overrides still parse for backward compatibility
 
 Property/value shapes currently translated:
@@ -192,12 +211,14 @@ Common Studio property groups currently snapshotted and pushed back:
 - `GuiObject`
 - `TextLabel`, `TextButton`, `TextBox`
 - `ImageLabel`, `ImageButton`
+- Button-specific state on `TextButton` and `ImageButton`
 - `ScrollingFrame`
 - `UIListLayout`
 - `UIGridLayout`
 - `UIPadding`
 - `UICorner`
 - `UIStroke`
+- `Decal`, `Texture`
 
 Current limitation:
 
@@ -450,7 +471,8 @@ Goal: make `nyjo` nicer than a bare-minimum sync utility.
 - [ ] Auto-generate common folders for remotes/shared code/UI
 - [ ] Support custom extension mappings
 - [ ] Support alternate project layouts
-- [ ] Export the parsed tree or sync plan as JSON
+- [x] Export the parsed tree as JSON
+- [ ] Export the sync plan as JSON
 - [x] Add richer plugin UI feedback
 - [ ] Add optional project templates
 - [ ] Add a doctor check for suspicious project structure
@@ -484,14 +506,14 @@ Exit criteria:
 
 Goal: make the project understandable to outside users.
 
-- [ ] Write a README
-- [ ] Add installation instructions
+- [x] Write a README
+- [x] Add installation instructions
 - [ ] Add a sample project
 - [ ] Add screenshots or demo gifs
-- [ ] Choose a license
-- [ ] Document limitations clearly
-- [ ] Explain what currently round-trips and what does not
-- [ ] Add a warning that `nyjo` is unofficial Roblox tooling
+- [x] Choose a license
+- [x] Document limitations clearly
+- [x] Explain what currently round-trips and what does not
+- [x] Add a warning that `nyjo` is unofficial Roblox tooling
 
 Exit criteria:
 
@@ -516,12 +538,12 @@ That order keeps the hard architectural work early and postpones polish until th
 ## Acceptance Scenarios
 
 - [ ] `nyjo init` creates a useful Roblox-style project tree
-- [x] A sample project using every supported extension parses into the expected classes
+- [x] Sample and unit-test coverage exists for supported extension parsing
 - [x] Hidden files and `.nyjoignore` patterns are skipped correctly
 - [x] Embedded headers and `.meta.json` can override class, properties, attributes, and tags where supported
 - [x] `GET /api/tree` returns the current parsed tree
 - [ ] A Studio snapshot can be ingested and normalized into the internal model
-- [x] `nyjo push` can create, update, and delete supported instances in Studio
+- [x] Dashboard/plugin push can create, update, and delete supported instances in Studio
 - [ ] Watch mode emits incremental updates without flooding
 - [x] Studio pull preview reports changed paths before writing
 - [x] Supported Studio changes can be written back to disk

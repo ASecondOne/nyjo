@@ -48,6 +48,30 @@ const LOGICAL_NODE_FILE_SUFFIXES: &[&str] = &[
     ".worldmodel",
     ".model",
     ".part",
+    ".screengui",
+    ".canvasgroup",
+    ".scrollingframe",
+    ".surfacegui",
+    ".billboardgui",
+    ".frame",
+    ".textlabel",
+    ".textbutton",
+    ".textbox",
+    ".imagelabel",
+    ".imagebutton",
+    ".uilistlayout",
+    ".uigridlayout",
+    ".uipadding",
+    ".uicorner",
+    ".uistroke",
+    ".texture",
+    ".decal",
+    ".stringvalue",
+    ".numbervalue",
+    ".intvalue",
+    ".boolvalue",
+    ".color3value",
+    ".vector3value",
     ".folder",
     ".lua",
     ".rf",
@@ -1051,11 +1075,18 @@ fn create_entry_impl(root: &Path, request: CreateRequest) -> Result<crate::model
 
     match node_type.as_str() {
         "directory" => {
+            if request.contents.is_some() {
+                bail!("cannot write file contents into directory {}", request.path);
+            }
+            validate_fixed_target_metadata(&target, request.metadata.as_ref())?;
             if target.exists() && !target.is_dir() {
                 bail!("{} already exists as a file", request.path);
             }
             fs::create_dir_all(&target)
                 .with_context(|| format!("failed to create directory {}", target.display()))?;
+            if let Some(metadata) = request.metadata {
+                write_metadata(&target, metadata)?;
+            }
         }
         "file" => {
             validate_fixed_target_metadata(&target, request.metadata.as_ref())?;
@@ -1104,6 +1135,7 @@ fn update_entry_impl(root: &Path, request: UpdateRequest) -> Result<crate::model
             bail!("cannot write file contents into directory {}", request.path);
         }
         if let Some(metadata) = request.metadata {
+            validate_fixed_target_metadata(&target, Some(&metadata))?;
             write_metadata(&target, metadata)?;
         }
     } else if let Some(always_embed_header) = embedded_metadata_mode(&target) {
@@ -1255,8 +1287,8 @@ impl<'a> StudioSyncPlanner<'a> {
         parent_class: Option<&str>,
         node: &StudioNode,
     ) -> Result<()> {
-        if node_has_container_children(node) {
-            return self.plan_container_node(parent_dir, parent_class, node);
+        if let Some(target_dir) = studio_container_target(parent_dir, node) {
+            return self.plan_container_node(&target_dir, parent_class, node);
         }
 
         if let Some((target, contents)) = studio_file_target(parent_dir, parent_class, node)? {
@@ -1308,20 +1340,19 @@ impl<'a> StudioSyncPlanner<'a> {
 
     fn plan_container_node(
         &mut self,
-        parent_dir: &Path,
+        target_dir: &Path,
         parent_class: Option<&str>,
         node: &StudioNode,
     ) -> Result<()> {
-        let target_dir = parent_dir.join(&node.name);
         if !self.plan_directory_target(
-            &target_dir,
+            target_dir,
             format!("directory-backed {} container", node.class_name),
         )? {
             return Ok(());
         }
 
         self.plan_metadata_target(
-            &target_dir,
+            target_dir,
             true,
             metadata_from_studio_node(node, true, parent_class),
             format!("metadata for {}", node.name),
@@ -1623,15 +1654,11 @@ impl<'a> StudioSyncPlanner<'a> {
     }
 
     fn apply(&mut self) -> Result<()> {
-        for write in &self.pending_writes {
+        let pending_writes = std::mem::take(&mut self.pending_writes);
+        for write in pending_writes {
             match write {
                 PendingWrite::EnsureDirectory { path } => {
-                    fs::create_dir_all(path).with_context(|| {
-                        format!(
-                            "failed to create studio-synced directory {}",
-                            path.display()
-                        )
-                    })?;
+                    self.ensure_directory_for_apply(&path)?;
                     self.plan.stats.directories_written += 1;
                 }
                 PendingWrite::WriteFile {
@@ -1640,22 +1667,20 @@ impl<'a> StudioSyncPlanner<'a> {
                     kind,
                 } => {
                     if let Some(parent) = path.parent() {
-                        fs::create_dir_all(parent).with_context(|| {
-                            format!("failed to create parent directory {}", parent.display())
-                        })?;
+                        self.ensure_directory_for_apply(parent)?;
                     }
 
-                    fs::write(path, contents)
+                    fs::write(&path, contents)
                         .with_context(|| format!("failed to write {}", path.display()))?;
 
-                    match *kind {
+                    match kind {
                         "metadata" => self.plan.stats.metadata_written += 1,
                         _ => self.plan.stats.files_written += 1,
                     }
                 }
                 PendingWrite::RemoveFile { path } => {
                     if path.exists() {
-                        fs::remove_file(path).with_context(|| {
+                        fs::remove_file(&path).with_context(|| {
                             format!("failed to remove studio-synced file {}", path.display())
                         })?;
                         self.plan.stats.removals_applied += 1;
@@ -1663,7 +1688,7 @@ impl<'a> StudioSyncPlanner<'a> {
                 }
                 PendingWrite::RemoveDirectory { path } => {
                     if path.exists() {
-                        fs::remove_dir_all(path).with_context(|| {
+                        fs::remove_dir_all(&path).with_context(|| {
                             format!(
                                 "failed to remove studio-synced directory {}",
                                 path.display()
@@ -1677,6 +1702,43 @@ impl<'a> StudioSyncPlanner<'a> {
 
         Ok(())
     }
+
+    fn ensure_directory_for_apply(&mut self, directory: &Path) -> Result<()> {
+        let mut ancestors = directory.ancestors().collect::<Vec<_>>();
+        ancestors.reverse();
+
+        for ancestor in ancestors {
+            if ancestor == self.project_root {
+                continue;
+            }
+
+            if ancestor.is_file() {
+                if !self.force {
+                    bail!(
+                        "local file {} blocks directory creation for {}; rerun with force to replace it",
+                        ancestor.display(),
+                        directory.display()
+                    );
+                }
+
+                fs::remove_file(ancestor).with_context(|| {
+                    format!(
+                        "failed to remove local file {} before creating directory {}",
+                        ancestor.display(),
+                        directory.display()
+                    )
+                })?;
+                self.plan.stats.removals_applied += 1;
+            }
+        }
+
+        fs::create_dir_all(directory).with_context(|| {
+            format!(
+                "failed to create studio-synced directory {}",
+                directory.display()
+            )
+        })
+    }
 }
 
 fn studio_file_target(
@@ -1684,6 +1746,13 @@ fn studio_file_target(
     parent_class: Option<&str>,
     node: &StudioNode,
 ) -> Result<Option<(PathBuf, String)>> {
+    if !node.children.is_empty() && has_child_local_name_collisions(&node.children) {
+        return Ok(Some((
+            parent_dir.join(format!("{}.instance.json", node.name)),
+            render_compact_instance_document(node)?,
+        )));
+    }
+
     let Some((suffix, contents, always_embed_header)) = (match node.class_name.as_str() {
         "Script" => Some((
             ".server.lua",
@@ -1708,6 +1777,30 @@ fn studio_file_target(
             render_structured_instance_contents(node)?,
             true,
         )),
+        "ScreenGui" => Some((".screengui", String::new(), false)),
+        "CanvasGroup" => Some((".canvasgroup", String::new(), false)),
+        "ScrollingFrame" => Some((".scrollingframe", String::new(), false)),
+        "SurfaceGui" => Some((".surfacegui", String::new(), false)),
+        "BillboardGui" => Some((".billboardgui", String::new(), false)),
+        "Frame" => Some((".frame", String::new(), false)),
+        "TextLabel" => Some((".textlabel", String::new(), false)),
+        "TextButton" => Some((".textbutton", String::new(), false)),
+        "TextBox" => Some((".textbox", String::new(), false)),
+        "ImageLabel" => Some((".imagelabel", String::new(), false)),
+        "ImageButton" => Some((".imagebutton", String::new(), false)),
+        "UIListLayout" => Some((".uilistlayout", String::new(), false)),
+        "UIGridLayout" => Some((".uigridlayout", String::new(), false)),
+        "UIPadding" => Some((".uipadding", String::new(), false)),
+        "UICorner" => Some((".uicorner", String::new(), false)),
+        "UIStroke" => Some((".uistroke", String::new(), false)),
+        "Texture" => Some((".texture", String::new(), false)),
+        "Decal" => Some((".decal", String::new(), false)),
+        "StringValue" => Some((".stringvalue", String::new(), false)),
+        "NumberValue" => Some((".numbervalue", String::new(), false)),
+        "IntValue" => Some((".intvalue", String::new(), false)),
+        "BoolValue" => Some((".boolvalue", String::new(), false)),
+        "Color3Value" => Some((".color3value", String::new(), false)),
+        "Vector3Value" => Some((".vector3value", String::new(), false)),
         _ => None,
     }) else {
         return Ok(Some((
@@ -1725,8 +1818,28 @@ fn studio_file_target(
     )))
 }
 
-fn node_has_container_children(node: &StudioNode) -> bool {
-    !node.children.is_empty() && container_source_file(node).is_some()
+fn studio_container_target(parent_dir: &Path, node: &StudioNode) -> Option<PathBuf> {
+    if node.children.is_empty() {
+        return None;
+    }
+
+    if has_child_local_name_collisions(&node.children) {
+        return None;
+    }
+
+    if container_source_file(node).is_some() {
+        return Some(parent_dir.join(&node.name));
+    }
+
+    if node.class_name == "Folder" {
+        return Some(parent_dir.join(&node.name));
+    }
+
+    if let Some(suffix) = typed_container_suffix_for_class(&node.class_name) {
+        return Some(parent_dir.join(format!("{}{}", node.name, suffix)));
+    }
+
+    Some(parent_dir.join(&node.name))
 }
 
 fn container_source_file(node: &StudioNode) -> Option<(&'static str, String)> {
@@ -1735,6 +1848,78 @@ fn container_source_file(node: &StudioNode) -> Option<(&'static str, String)> {
         "LocalScript" => Some(("init.client.lua", node.source.clone().unwrap_or_default())),
         "ModuleScript" => Some(("init.lua", node.source.clone().unwrap_or_default())),
         "RemoteFunction" | "RemoteEvent" | "BindableFunction" | "BindableEvent" => None,
+        _ => None,
+    }
+}
+
+fn has_child_local_name_collisions(children: &[StudioNode]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    children
+        .iter()
+        .any(|child| !seen.insert(studio_local_entry_name(child)))
+}
+
+fn studio_local_entry_name(node: &StudioNode) -> String {
+    if !node.children.is_empty() {
+        if container_source_file(node).is_some() || node.class_name == "Folder" {
+            return node.name.clone();
+        }
+
+        if let Some(suffix) = typed_container_suffix_for_class(&node.class_name) {
+            return format!("{}{}", node.name, suffix);
+        }
+
+        return node.name.clone();
+    }
+
+    match node.class_name.as_str() {
+        "Script" => format!("{}.server.lua", node.name),
+        "LocalScript" => format!("{}.client.lua", node.name),
+        "ModuleScript" => format!("{}.lua", node.name),
+        "RemoteFunction" => format!("{}.rf", node.name),
+        "RemoteEvent" => format!("{}.re", node.name),
+        "BindableFunction" => format!("{}.bf", node.name),
+        "BindableEvent" => format!("{}.be", node.name),
+        "Folder" => format!("{}.folder", node.name),
+        _ => typed_container_suffix_for_class(&node.class_name)
+            .map(|suffix| format!("{}{}", node.name, suffix))
+            .unwrap_or_else(|| format!("{}.instance.json", node.name)),
+    }
+}
+
+fn typed_container_suffix_for_class(class_name: &str) -> Option<&'static str> {
+    match class_name {
+        "Part" => Some(".part"),
+        "Model" => Some(".model"),
+        "WorldModel" => Some(".worldmodel"),
+        "RemoteFunction" => Some(".rf"),
+        "RemoteEvent" => Some(".re"),
+        "BindableFunction" => Some(".bf"),
+        "BindableEvent" => Some(".be"),
+        "ScreenGui" => Some(".screengui"),
+        "CanvasGroup" => Some(".canvasgroup"),
+        "ScrollingFrame" => Some(".scrollingframe"),
+        "SurfaceGui" => Some(".surfacegui"),
+        "BillboardGui" => Some(".billboardgui"),
+        "Frame" => Some(".frame"),
+        "TextLabel" => Some(".textlabel"),
+        "TextButton" => Some(".textbutton"),
+        "TextBox" => Some(".textbox"),
+        "ImageLabel" => Some(".imagelabel"),
+        "ImageButton" => Some(".imagebutton"),
+        "UIListLayout" => Some(".uilistlayout"),
+        "UIGridLayout" => Some(".uigridlayout"),
+        "UIPadding" => Some(".uipadding"),
+        "UICorner" => Some(".uicorner"),
+        "UIStroke" => Some(".uistroke"),
+        "Texture" => Some(".texture"),
+        "Decal" => Some(".decal"),
+        "StringValue" => Some(".stringvalue"),
+        "NumberValue" => Some(".numbervalue"),
+        "IntValue" => Some(".intvalue"),
+        "BoolValue" => Some(".boolvalue"),
+        "Color3Value" => Some(".color3value"),
+        "Vector3Value" => Some(".vector3value"),
         _ => None,
     }
 }
@@ -1825,22 +2010,20 @@ fn render_structured_instance_contents(node: &StudioNode) -> Result<String> {
         return Ok(String::new());
     }
 
-    let mut children = serde_json::Map::new();
-    for child in &node.children {
-        children.insert(child.name.clone(), studio_node_to_inline_value(child)?);
-    }
-
-    Ok(serde_json::to_string_pretty(
-        &json!({ "children": children }),
-    )?)
+    Ok(serde_json::to_string_pretty(&json!({
+        "children": studio_children_to_inline_value(&node.children)?
+    }))?)
 }
 
 fn render_compact_instance_document(node: &StudioNode) -> Result<String> {
-    serde_json::to_string_pretty(&studio_node_to_inline_value(node)?).map_err(Into::into)
+    serde_json::to_string_pretty(&studio_node_to_inline_value(node, false)?).map_err(Into::into)
 }
 
-fn studio_node_to_inline_value(node: &StudioNode) -> Result<Value> {
+fn studio_node_to_inline_value(node: &StudioNode, include_name: bool) -> Result<Value> {
     let mut object = serde_json::Map::new();
+    if include_name {
+        object.insert("name".to_string(), Value::String(node.name.clone()));
+    }
     object.insert(
         "className".to_string(),
         Value::String(node.class_name.clone()),
@@ -1865,14 +2048,37 @@ fn studio_node_to_inline_value(node: &StudioNode) -> Result<Value> {
         object.insert("source".to_string(), Value::String(source.clone()));
     }
     if !node.children.is_empty() {
-        let mut children = serde_json::Map::new();
-        for child in &node.children {
-            children.insert(child.name.clone(), studio_node_to_inline_value(child)?);
-        }
-        object.insert("children".to_string(), Value::Object(children));
+        object.insert(
+            "children".to_string(),
+            studio_children_to_inline_value(&node.children)?,
+        );
     }
 
     Ok(Value::Object(object))
+}
+
+fn studio_children_to_inline_value(children: &[StudioNode]) -> Result<Value> {
+    if has_duplicate_child_names(children) {
+        return children
+            .iter()
+            .map(|child| studio_node_to_inline_value(child, true))
+            .collect::<Result<Vec<_>>>()
+            .map(Value::Array);
+    }
+
+    let mut children_by_name = serde_json::Map::new();
+    for child in children {
+        children_by_name.insert(
+            child.name.clone(),
+            studio_node_to_inline_value(child, false)?,
+        );
+    }
+    Ok(Value::Object(children_by_name))
+}
+
+fn has_duplicate_child_names(children: &[StudioNode]) -> bool {
+    let mut seen = std::collections::BTreeSet::new();
+    children.iter().any(|child| !seen.insert(&child.name))
 }
 
 fn class_needs_metadata(
@@ -1882,6 +2088,10 @@ fn class_needs_metadata(
 ) -> bool {
     if is_directory_target {
         if node.class_name == "Folder" {
+            return false;
+        }
+
+        if typed_container_suffix_for_class(&node.class_name).is_some() {
             return false;
         }
 
@@ -2011,6 +2221,30 @@ fn embedded_metadata_mode(target: &Path) -> Option<bool> {
         || file_name.ends_with(".re")
         || file_name.ends_with(".bf")
         || file_name.ends_with(".be")
+        || file_name.ends_with(".screengui")
+        || file_name.ends_with(".canvasgroup")
+        || file_name.ends_with(".scrollingframe")
+        || file_name.ends_with(".surfacegui")
+        || file_name.ends_with(".billboardgui")
+        || file_name.ends_with(".frame")
+        || file_name.ends_with(".textlabel")
+        || file_name.ends_with(".textbutton")
+        || file_name.ends_with(".textbox")
+        || file_name.ends_with(".imagelabel")
+        || file_name.ends_with(".imagebutton")
+        || file_name.ends_with(".uilistlayout")
+        || file_name.ends_with(".uigridlayout")
+        || file_name.ends_with(".uipadding")
+        || file_name.ends_with(".uicorner")
+        || file_name.ends_with(".uistroke")
+        || file_name.ends_with(".texture")
+        || file_name.ends_with(".decal")
+        || file_name.ends_with(".stringvalue")
+        || file_name.ends_with(".numbervalue")
+        || file_name.ends_with(".intvalue")
+        || file_name.ends_with(".boolvalue")
+        || file_name.ends_with(".color3value")
+        || file_name.ends_with(".vector3value")
     {
         return Some(false);
     }
@@ -2045,6 +2279,78 @@ fn fixed_target_class(target: &Path) -> Option<String> {
     }
     if file_name.ends_with(".model") {
         return Some("Model".to_string());
+    }
+    if file_name.ends_with(".screengui") {
+        return Some("ScreenGui".to_string());
+    }
+    if file_name.ends_with(".canvasgroup") {
+        return Some("CanvasGroup".to_string());
+    }
+    if file_name.ends_with(".scrollingframe") {
+        return Some("ScrollingFrame".to_string());
+    }
+    if file_name.ends_with(".surfacegui") {
+        return Some("SurfaceGui".to_string());
+    }
+    if file_name.ends_with(".billboardgui") {
+        return Some("BillboardGui".to_string());
+    }
+    if file_name.ends_with(".frame") {
+        return Some("Frame".to_string());
+    }
+    if file_name.ends_with(".textlabel") {
+        return Some("TextLabel".to_string());
+    }
+    if file_name.ends_with(".textbutton") {
+        return Some("TextButton".to_string());
+    }
+    if file_name.ends_with(".textbox") {
+        return Some("TextBox".to_string());
+    }
+    if file_name.ends_with(".imagelabel") {
+        return Some("ImageLabel".to_string());
+    }
+    if file_name.ends_with(".imagebutton") {
+        return Some("ImageButton".to_string());
+    }
+    if file_name.ends_with(".uilistlayout") {
+        return Some("UIListLayout".to_string());
+    }
+    if file_name.ends_with(".uigridlayout") {
+        return Some("UIGridLayout".to_string());
+    }
+    if file_name.ends_with(".uipadding") {
+        return Some("UIPadding".to_string());
+    }
+    if file_name.ends_with(".uicorner") {
+        return Some("UICorner".to_string());
+    }
+    if file_name.ends_with(".uistroke") {
+        return Some("UIStroke".to_string());
+    }
+    if file_name.ends_with(".texture") {
+        return Some("Texture".to_string());
+    }
+    if file_name.ends_with(".decal") {
+        return Some("Decal".to_string());
+    }
+    if file_name.ends_with(".stringvalue") {
+        return Some("StringValue".to_string());
+    }
+    if file_name.ends_with(".numbervalue") {
+        return Some("NumberValue".to_string());
+    }
+    if file_name.ends_with(".intvalue") {
+        return Some("IntValue".to_string());
+    }
+    if file_name.ends_with(".boolvalue") {
+        return Some("BoolValue".to_string());
+    }
+    if file_name.ends_with(".color3value") {
+        return Some("Color3Value".to_string());
+    }
+    if file_name.ends_with(".vector3value") {
+        return Some("Vector3Value".to_string());
     }
     if file_name.ends_with(".folder") {
         return Some("Folder".to_string());
@@ -2084,7 +2390,7 @@ fn validate_fixed_target_metadata(target: &Path, metadata: Option<&NodeMetadata>
     }
 
     bail!(
-        "file {} has a fixed local shape and cannot declare className {}; expected {}",
+        "path {} has a fixed local shape and cannot declare className {}; expected {}",
         target.display(),
         declared_class_name,
         expected_class_name
@@ -2423,7 +2729,7 @@ mod tests {
     }
 
     #[test]
-    fn syncs_generic_instances_into_structured_instance_files() -> Result<()> {
+    fn syncs_nested_parts_into_typed_directories() -> Result<()> {
         let dir = tempdir()?;
         let request = studio_sync_request(StudioNode {
             name: "game".to_string(),
@@ -2466,18 +2772,271 @@ mod tests {
         });
 
         sync_from_studio_impl(dir.path(), request)?;
-        let part_source = fs::read_to_string(dir.path().join("Workspace/Spawn.part"))?;
-        assert!(part_source.contains("--!nyjo"));
-        assert!(part_source.contains("\"Anchored\": true"));
-        assert!(part_source.contains("\"SpawnPoint\""));
-        assert!(part_source.contains("\"Label\""));
-        assert!(!dir.path().join("Workspace/Spawn/.meta.json").exists());
+        let part_dir = dir.path().join("Workspace/Spawn.part");
+        assert!(part_dir.is_dir());
+        let part_metadata = fs::read_to_string(part_dir.join(".meta.json"))?;
+        assert!(part_metadata.contains("\"Anchored\": true"));
+        assert!(part_metadata.contains("\"SpawnPoint\""));
+
+        let label_source = fs::read_to_string(part_dir.join("Label.stringvalue"))?;
+        assert!(label_source.contains("--!nyjo"));
+        assert!(label_source.contains("\"Value\": \"Spawn\""));
+        assert!(!part_dir.join("Label.meta.json").exists());
 
         Ok(())
     }
 
     #[test]
-    fn syncs_generic_ui_trees_into_compact_instance_files() -> Result<()> {
+    fn force_pull_serializes_duplicate_child_names_as_compact_json() -> Result<()> {
+        let dir = tempdir()?;
+        fs::create_dir_all(dir.path().join("Workspace"))?;
+        fs::write(dir.path().join("Workspace/Shop.model"), "")?;
+
+        let request = StudioSyncRequest {
+            tree: StudioNode {
+                name: "game".to_string(),
+                class_name: "DataModel".to_string(),
+                children: vec![StudioNode {
+                    name: "Workspace".to_string(),
+                    class_name: "Workspace".to_string(),
+                    children: vec![StudioNode {
+                        name: "Shop".to_string(),
+                        class_name: "Model".to_string(),
+                        children: vec![StudioNode {
+                            name: "Lantern".to_string(),
+                            class_name: "Model".to_string(),
+                            children: vec![
+                                StudioNode {
+                                    name: "Part".to_string(),
+                                    class_name: "Part".to_string(),
+                                    children: vec![StudioNode {
+                                        name: "Surface".to_string(),
+                                        class_name: "Texture".to_string(),
+                                        children: vec![],
+                                        properties: Default::default(),
+                                        attributes: Default::default(),
+                                        tags: vec![],
+                                        source: None,
+                                    }],
+                                    properties: Default::default(),
+                                    attributes: Default::default(),
+                                    tags: vec![],
+                                    source: None,
+                                },
+                                StudioNode {
+                                    name: "Part".to_string(),
+                                    class_name: "Part".to_string(),
+                                    children: vec![],
+                                    properties: Default::default(),
+                                    attributes: Default::default(),
+                                    tags: vec![],
+                                    source: None,
+                                },
+                            ],
+                            properties: Default::default(),
+                            attributes: Default::default(),
+                            tags: vec![],
+                            source: None,
+                        }],
+                        properties: Default::default(),
+                        attributes: Default::default(),
+                        tags: vec![],
+                        source: None,
+                    }],
+                    properties: Default::default(),
+                    attributes: Default::default(),
+                    tags: vec![],
+                    source: None,
+                }],
+                properties: Default::default(),
+                attributes: Default::default(),
+                tags: vec![],
+                source: None,
+            },
+            mode: StudioSyncMode::Apply,
+            force: true,
+        };
+
+        let response = sync_from_studio_impl(dir.path(), request)?;
+        assert!(response.applied);
+        assert!(dir.path().join("Workspace/Shop.model").is_dir());
+
+        let lantern_document = fs::read_to_string(
+            dir.path()
+                .join("Workspace/Shop.model/Lantern.instance.json"),
+        )?;
+        assert!(lantern_document.contains("\"className\": \"Model\""));
+        assert!(lantern_document.contains("\"name\": \"Part\""));
+        assert!(lantern_document.contains("\"Surface\""));
+
+        let tree = response
+            .tree
+            .expect("expected updated tree after force pull");
+        let workspace = tree
+            .children
+            .iter()
+            .find(|child| child.name == "Workspace")
+            .expect("missing Workspace");
+        let shop = workspace
+            .children
+            .iter()
+            .find(|child| child.name == "Shop")
+            .expect("missing Shop");
+        let lantern = shop
+            .children
+            .iter()
+            .find(|child| child.name == "Lantern")
+            .expect("missing Lantern");
+        assert_eq!(
+            lantern
+                .children
+                .iter()
+                .filter(|child| child.name == "Part")
+                .count(),
+            2
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn force_pull_replaces_file_parent_with_directory_for_nested_children() -> Result<()> {
+        let dir = tempdir()?;
+        fs::create_dir_all(dir.path().join("Workspace/Shop.model/Lantern.model"))?;
+        fs::write(
+            dir.path()
+                .join("Workspace/Shop.model/Lantern.model/Part.part"),
+            "",
+        )?;
+
+        let request = StudioSyncRequest {
+            tree: StudioNode {
+                name: "game".to_string(),
+                class_name: "DataModel".to_string(),
+                children: vec![StudioNode {
+                    name: "Workspace".to_string(),
+                    class_name: "Workspace".to_string(),
+                    children: vec![StudioNode {
+                        name: "Shop".to_string(),
+                        class_name: "Model".to_string(),
+                        children: vec![StudioNode {
+                            name: "Lantern".to_string(),
+                            class_name: "Model".to_string(),
+                            children: vec![StudioNode {
+                                name: "Part".to_string(),
+                                class_name: "Part".to_string(),
+                                children: vec![StudioNode {
+                                    name: "Mesh".to_string(),
+                                    class_name: "SpecialMesh".to_string(),
+                                    children: vec![],
+                                    properties: Default::default(),
+                                    attributes: Default::default(),
+                                    tags: vec![],
+                                    source: None,
+                                }],
+                                properties: Default::default(),
+                                attributes: Default::default(),
+                                tags: vec![],
+                                source: None,
+                            }],
+                            properties: Default::default(),
+                            attributes: Default::default(),
+                            tags: vec![],
+                            source: None,
+                        }],
+                        properties: Default::default(),
+                        attributes: Default::default(),
+                        tags: vec![],
+                        source: None,
+                    }],
+                    properties: Default::default(),
+                    attributes: Default::default(),
+                    tags: vec![],
+                    source: None,
+                }],
+                properties: Default::default(),
+                attributes: Default::default(),
+                tags: vec![],
+                source: None,
+            },
+            mode: StudioSyncMode::Apply,
+            force: true,
+        };
+
+        let response = sync_from_studio_impl(dir.path(), request)?;
+        assert!(response.applied);
+        let part_dir = dir
+            .path()
+            .join("Workspace/Shop.model/Lantern.model/Part.part");
+        assert!(part_dir.is_dir());
+        assert!(part_dir.join("Mesh.instance.json").is_file());
+
+        Ok(())
+    }
+
+    #[test]
+    fn force_pull_replaces_file_target_with_directory() -> Result<()> {
+        let dir = tempdir()?;
+        fs::create_dir_all(dir.path().join("Workspace/Spacegate.model"))?;
+        fs::write(dir.path().join("Workspace/Spacegate.model/Part.part"), "")?;
+
+        let request = StudioSyncRequest {
+            tree: StudioNode {
+                name: "game".to_string(),
+                class_name: "DataModel".to_string(),
+                children: vec![StudioNode {
+                    name: "Workspace".to_string(),
+                    class_name: "Workspace".to_string(),
+                    children: vec![StudioNode {
+                        name: "Spacegate".to_string(),
+                        class_name: "Model".to_string(),
+                        children: vec![StudioNode {
+                            name: "Part".to_string(),
+                            class_name: "Part".to_string(),
+                            children: vec![StudioNode {
+                                name: "Decal".to_string(),
+                                class_name: "Decal".to_string(),
+                                children: vec![],
+                                properties: Default::default(),
+                                attributes: Default::default(),
+                                tags: vec![],
+                                source: None,
+                            }],
+                            properties: Default::default(),
+                            attributes: Default::default(),
+                            tags: vec![],
+                            source: None,
+                        }],
+                        properties: Default::default(),
+                        attributes: Default::default(),
+                        tags: vec![],
+                        source: None,
+                    }],
+                    properties: Default::default(),
+                    attributes: Default::default(),
+                    tags: vec![],
+                    source: None,
+                }],
+                properties: Default::default(),
+                attributes: Default::default(),
+                tags: vec![],
+                source: None,
+            },
+            mode: StudioSyncMode::Apply,
+            force: true,
+        };
+
+        let response = sync_from_studio_impl(dir.path(), request)?;
+        assert!(response.applied);
+        let part_dir = dir.path().join("Workspace/Spacegate.model/Part.part");
+        assert!(part_dir.is_dir());
+        assert!(part_dir.join("Decal.decal").is_file());
+
+        Ok(())
+    }
+
+    #[test]
+    fn syncs_nested_ui_trees_into_typed_directories() -> Result<()> {
         let dir = tempdir()?;
         let request = studio_sync_request(StudioNode {
             name: "game".to_string(),
@@ -2489,23 +3048,27 @@ mod tests {
                     name: "Hud".to_string(),
                     class_name: "ScreenGui".to_string(),
                     children: vec![StudioNode {
-                        name: "Root".to_string(),
-                        class_name: "Frame".to_string(),
+                        name: "Play".to_string(),
+                        class_name: "TextButton".to_string(),
                         children: vec![StudioNode {
-                            name: "Title".to_string(),
-                            class_name: "TextLabel".to_string(),
+                            name: "Corner".to_string(),
+                            class_name: "UICorner".to_string(),
                             children: vec![],
                             properties: std::collections::BTreeMap::from([(
-                                "Text".to_string(),
-                                json!("Nyjo"),
+                                "CornerRadius".to_string(),
+                                json!({
+                                    "__nyjoType": "UDim",
+                                    "scale": 0.25,
+                                    "offset": 0
+                                }),
                             )]),
                             attributes: Default::default(),
                             tags: vec![],
                             source: None,
                         }],
                         properties: std::collections::BTreeMap::from([(
-                            "Visible".to_string(),
-                            json!(true),
+                            "Text".to_string(),
+                            json!("Play"),
                         )]),
                         attributes: Default::default(),
                         tags: vec![],
@@ -2531,12 +3094,19 @@ mod tests {
         });
 
         sync_from_studio_impl(dir.path(), request)?;
-        let document = fs::read_to_string(dir.path().join("StarterGui/Hud.instance.json"))?;
-        assert!(document.contains("\"className\": \"ScreenGui\""));
-        assert!(document.contains("\"ResetOnSpawn\": false"));
-        assert!(document.contains("\"Root\""));
-        assert!(document.contains("\"Title\""));
-        assert!(!dir.path().join("StarterGui/Hud/.meta.json").exists());
+        let hud_dir = dir.path().join("StarterGui/Hud.screengui");
+        assert!(hud_dir.is_dir());
+        let hud_metadata = fs::read_to_string(hud_dir.join(".meta.json"))?;
+        assert!(hud_metadata.contains("\"ResetOnSpawn\": false"));
+
+        let play_dir = hud_dir.join("Play.textbutton");
+        assert!(play_dir.is_dir());
+        let play_metadata = fs::read_to_string(play_dir.join(".meta.json"))?;
+        assert!(play_metadata.contains("\"Text\": \"Play\""));
+
+        let corner_source = fs::read_to_string(play_dir.join("Corner.uicorner"))?;
+        assert!(corner_source.contains("--!nyjo"));
+        assert!(corner_source.contains("\"CornerRadius\""));
 
         Ok(())
     }
@@ -2577,6 +3147,47 @@ mod tests {
                 .iter()
                 .any(|child| child.name == "ServerScriptService")
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_entry_writes_metadata_for_typed_directories() -> Result<()> {
+        let dir = tempdir()?;
+        let tree = create_entry_impl(
+            dir.path(),
+            CreateRequest {
+                path: "Workspace/Spawn.part".to_string(),
+                node_type: Some("directory".to_string()),
+                contents: None,
+                metadata: Some(NodeMetadata {
+                    class_name: None,
+                    properties: std::collections::BTreeMap::from([(
+                        "Anchored".to_string(),
+                        json!(true),
+                    )]),
+                    attributes: Default::default(),
+                    tags: vec!["SpawnPoint".to_string()],
+                }),
+                overwrite: false,
+            },
+        )?;
+
+        let metadata = fs::read_to_string(dir.path().join("Workspace/Spawn.part/.meta.json"))?;
+        assert!(metadata.contains("\"Anchored\": true"));
+        assert!(metadata.contains("\"SpawnPoint\""));
+
+        let workspace = tree
+            .children
+            .iter()
+            .find(|child| child.name == "Workspace")
+            .expect("missing Workspace");
+        let spawn = workspace
+            .children
+            .iter()
+            .find(|child| child.name == "Spawn")
+            .expect("missing Spawn");
+        assert_eq!(spawn.class_name, "Part");
 
         Ok(())
     }
