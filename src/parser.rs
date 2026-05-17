@@ -91,6 +91,126 @@ const EXTENSION_SPECS: &[ExtensionSpec] = &[
         payload: PayloadKind::StructuredInstance,
     },
     ExtensionSpec {
+        suffix: ".screengui",
+        default_class: "ScreenGui",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".canvasgroup",
+        default_class: "CanvasGroup",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".scrollingframe",
+        default_class: "ScrollingFrame",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".surfacegui",
+        default_class: "SurfaceGui",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".billboardgui",
+        default_class: "BillboardGui",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".frame",
+        default_class: "Frame",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".textlabel",
+        default_class: "TextLabel",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".textbutton",
+        default_class: "TextButton",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".textbox",
+        default_class: "TextBox",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".imagelabel",
+        default_class: "ImageLabel",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".imagebutton",
+        default_class: "ImageButton",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".uilistlayout",
+        default_class: "UIListLayout",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".uigridlayout",
+        default_class: "UIGridLayout",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".uipadding",
+        default_class: "UIPadding",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".uicorner",
+        default_class: "UICorner",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".uistroke",
+        default_class: "UIStroke",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".texture",
+        default_class: "Texture",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".decal",
+        default_class: "Decal",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".stringvalue",
+        default_class: "StringValue",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".numbervalue",
+        default_class: "NumberValue",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".intvalue",
+        default_class: "IntValue",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".boolvalue",
+        default_class: "BoolValue",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".color3value",
+        default_class: "Color3Value",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".vector3value",
+        default_class: "Vector3Value",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
         suffix: ".service.json",
         default_class: "",
         payload: PayloadKind::ServiceJson,
@@ -254,17 +374,42 @@ impl ParseContext {
         parent_class: Option<&str>,
         top_level: bool,
     ) -> Result<InstanceNode> {
-        let name = file_name(path)?;
+        let directory_name = file_name(path)?;
+        let typed_directory = typed_directory_spec(&directory_name);
+        let fixed_directory_class = typed_directory.map(|spec| spec.default_class);
+        let logical_name = if let Some(spec) = typed_directory {
+            directory_name
+                .strip_suffix(spec.suffix)
+                .filter(|candidate| !candidate.is_empty())
+                .map(ToOwned::to_owned)
+                .with_context(|| {
+                    format!(
+                        "failed to derive node name from directory {} using suffix {}",
+                        path.display(),
+                        spec.suffix
+                    )
+                })?
+        } else {
+            directory_name.clone()
+        };
         let mut metadata = load_directory_metadata(path)?;
-        let base_class_name = special_directory_class(parent_class, top_level, &name)
-            .unwrap_or("Folder")
-            .to_string();
+        let base_class_name = typed_directory
+            .map(|spec| spec.default_class.to_string())
+            .unwrap_or_else(|| {
+                special_directory_class(parent_class, top_level, &directory_name)
+                    .unwrap_or("Folder")
+                    .to_string()
+            });
         let mut class_name = metadata
             .as_ref()
             .and_then(|metadata| metadata.class_name.clone())
             .unwrap_or(base_class_name);
 
-        let source_file = detect_directory_source_file(path, Some(&class_name))?;
+        let source_file = if typed_directory.is_none() {
+            detect_directory_source_file(path, Some(&class_name))?
+        } else {
+            None
+        };
         if metadata.is_none()
             && let Some((detected_class_name, _)) = source_file
         {
@@ -272,7 +417,7 @@ impl ParseContext {
         }
 
         let mut node = InstanceNode::new(
-            name,
+            logical_name,
             class_name,
             self.relative_string(path),
             SourceKind::Directory,
@@ -313,6 +458,16 @@ impl ParseContext {
                 source_file_name,
                 &node.class_name,
                 detected_class_name,
+            )?;
+        }
+        if let Some(expected_class_name) = fixed_directory_class {
+            validate_fixed_directory_class(
+                path,
+                typed_directory
+                    .expect("typed directory should exist")
+                    .suffix,
+                &node.class_name,
+                expected_class_name,
             )?;
         }
 
@@ -763,6 +918,16 @@ fn extension_spec(file_name: &str) -> Option<&'static ExtensionSpec> {
         .find(|spec| file_name.ends_with(spec.suffix))
 }
 
+fn typed_directory_spec(file_name: &str) -> Option<&'static ExtensionSpec> {
+    extension_spec(file_name).and_then(|spec| match spec.payload {
+        PayloadKind::Text
+        | PayloadKind::Json
+        | PayloadKind::InstanceJson
+        | PayloadKind::ServiceJson => None,
+        PayloadKind::Empty | PayloadKind::StructuredInstance => Some(spec),
+    })
+}
+
 fn expected_fixed_class_for_file(spec: &ExtensionSpec, node_name: &str) -> Option<String> {
     match spec.payload {
         PayloadKind::InstanceJson => None,
@@ -804,6 +969,25 @@ fn validate_fixed_directory_source_class(
         "directory {} uses fixed script source {} and cannot declare className {}; expected {}",
         directory.display(),
         source_file_name,
+        actual_class_name,
+        expected_class_name
+    )
+}
+
+fn validate_fixed_directory_class(
+    path: &Path,
+    suffix: &str,
+    actual_class_name: &str,
+    expected_class_name: &str,
+) -> Result<()> {
+    if actual_class_name == expected_class_name {
+        return Ok(());
+    }
+
+    bail!(
+        "directory {} uses fixed suffix {} and cannot declare className {}; expected {}",
+        path.display(),
+        suffix,
         actual_class_name,
         expected_class_name
     )
@@ -1480,6 +1664,126 @@ print("boot")"#,
                 .and_then(|value| value.as_str()),
             Some("Spawn")
         );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parses_typed_part_directory_with_nested_texture_file() -> Result<()> {
+        let dir = tempdir()?;
+        write_file(
+            dir.path(),
+            "Workspace/Spawn.part/.meta.json",
+            r#"{
+  "properties": {
+    "Anchored": true
+  }
+}"#,
+        )?;
+        write_file(
+            dir.path(),
+            "Workspace/Spawn.part/Surface.texture",
+            r#"--!nyjo
+--HEADER
+--{
+--  "properties": {
+--    "Texture": "rbxassetid://123",
+--    "Transparency": 0.25
+--  },
+--  "attributes": {
+--    "Layer": "Top"
+--  }
+--}
+--CONTENTS
+"#,
+        )?;
+
+        let tree = scan_project(dir.path())?;
+        let workspace = child(&tree, "Workspace");
+        let spawn = child(workspace, "Spawn");
+        assert_eq!(spawn.class_name, "Part");
+        assert_eq!(
+            spawn
+                .properties
+                .get("Anchored")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+
+        let surface = child(spawn, "Surface");
+        assert_eq!(surface.class_name, "Texture");
+        assert_eq!(
+            surface
+                .properties
+                .get("Texture")
+                .and_then(|value| value.as_str()),
+            Some("rbxassetid://123")
+        );
+        assert_eq!(
+            surface
+                .properties
+                .get("Transparency")
+                .and_then(|value| value.as_f64()),
+            Some(0.25)
+        );
+        assert_eq!(
+            surface
+                .attributes
+                .get("Layer")
+                .and_then(|value| value.as_str()),
+            Some("Top")
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parses_typed_ui_directories_with_nested_children() -> Result<()> {
+        let dir = tempdir()?;
+        write_file(
+            dir.path(),
+            "StarterGui/Hud.screengui/.meta.json",
+            r#"{
+  "properties": {
+    "ResetOnSpawn": false
+  }
+}"#,
+        )?;
+        write_file(
+            dir.path(),
+            "StarterGui/Hud.screengui/Play.textbutton/.meta.json",
+            r#"{
+  "properties": {
+    "Text": "Play"
+  }
+}"#,
+        )?;
+        write_file(
+            dir.path(),
+            "StarterGui/Hud.screengui/Play.textbutton/Corner.uicorner",
+            "",
+        )?;
+
+        let tree = scan_project(dir.path())?;
+        let starter_gui = child(&tree, "StarterGui");
+        let hud = child(starter_gui, "Hud");
+        assert_eq!(hud.class_name, "ScreenGui");
+        assert_eq!(
+            hud.properties
+                .get("ResetOnSpawn")
+                .and_then(|value| value.as_bool()),
+            Some(false)
+        );
+
+        let play = child(hud, "Play");
+        assert_eq!(play.class_name, "TextButton");
+        assert_eq!(
+            play.properties.get("Text").and_then(|value| value.as_str()),
+            Some("Play")
+        );
+
+        let corner = child(play, "Corner");
+        assert_eq!(corner.class_name, "UICorner");
 
         Ok(())
     }

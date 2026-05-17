@@ -73,6 +73,7 @@ local TEXT_PROPERTIES = {
 	"TextXAlignment",
 	"TextYAlignment",
 }
+local BUTTON_PROPERTIES = { "AutoButtonColor", "Modal", "Selected" }
 local IMAGE_PROPERTIES = { "Image", "ImageColor3", "ImageTransparency", "ScaleType" }
 local SCROLLING_FRAME_PROPERTIES = {
 	"AutomaticCanvasSize",
@@ -99,6 +100,8 @@ local UI_GRID_LAYOUT_PROPERTIES = {
 local UI_PADDING_PROPERTIES = { "PaddingTop", "PaddingBottom", "PaddingLeft", "PaddingRight" }
 local UI_CORNER_PROPERTIES = { "CornerRadius" }
 local UI_STROKE_PROPERTIES = { "ApplyStrokeMode", "Color", "Thickness", "Transparency" }
+local DECAL_PROPERTIES = { "Color3", "Face", "Texture", "Transparency" }
+local TEXTURE_PROPERTIES = { "OffsetStudsU", "OffsetStudsV", "StudsPerTileU", "StudsPerTileV" }
 
 local toolbar = plugin:CreateToolbar(TOOLBAR_ID)
 local toggleButton = toolbar:CreateButton(BUTTON_ID, "Open Nyjo", "")
@@ -688,6 +691,10 @@ local function extractStudioProperties(instance)
 		copyProperties(instance, TEXT_PROPERTIES, properties)
 	end
 
+	if instance:IsA("TextButton") or instance:IsA("ImageButton") then
+		copyProperties(instance, BUTTON_PROPERTIES, properties)
+	end
+
 	if instance:IsA("ImageLabel") or instance:IsA("ImageButton") then
 		copyProperties(instance, IMAGE_PROPERTIES, properties)
 	end
@@ -714,6 +721,14 @@ local function extractStudioProperties(instance)
 
 	if instance:IsA("UIStroke") then
 		copyProperties(instance, UI_STROKE_PROPERTIES, properties)
+	end
+
+	if instance:IsA("Decal") or instance:IsA("Texture") then
+		copyProperties(instance, DECAL_PROPERTIES, properties)
+	end
+
+	if instance:IsA("Texture") then
+		copyProperties(instance, TEXTURE_PROPERTIES, properties)
 	end
 
 	return properties

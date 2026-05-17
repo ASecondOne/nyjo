@@ -9,9 +9,10 @@ It scans a Linux-friendly project folder, turns it into a Roblox-style instance 
 ## What It Does
 
 - Parses a local project into one canonical in-memory instance tree
-- Maps Roblox-aware file extensions like `.server.lua`, `.client.lua`, `.lua`, `.re`, `.rf`, `.bf`, and `.be`
+- Maps Roblox-aware file extensions like `.server.lua`, `.client.lua`, `.lua`, `.re`, `.rf`, `.bf`, `.be`, and common typed UI/value/visual shapes
 - Supports compact subtree files like `.instance.json`, `.model.json`, and `.service.json`
 - Supports embedded metadata headers inside file-backed nodes, so many cases no longer need sidecar `.meta.json` files
+- Supports typed container directories for child-bearing non-script instances like parts, UI trees, value objects, and textures
 - Runs a local server and browser dashboard for status, logs, preview, and sync control
 - Installs a Roblox Studio plugin bridge for Linux/Vinegar-based Studio setups
 - Supports Studio push plus Studio pull with preview/apply/force modes
@@ -137,9 +138,14 @@ Then open Roblox Studio on Linux, load the Nyjo plugin, and use the browser dash
 - `nyjo doctor --root <path>`
   Prints a quick project summary and class counts.
 
+Current workflow note:
+
+- Standalone `nyjo push`, `nyjo pull`, `nyjo watch`, and `nyjo diff` subcommands do not exist yet.
+- Sync currently flows through `nyjo serve`, the browser dashboard, and the Studio plugin bridge.
+
 ## Local Project Format
 
-Some of the main local shapes are:
+Representative local shapes:
 
 - `Boot.server.lua` -> `Script`
 - `Hud.client.lua` -> `LocalScript`
@@ -152,6 +158,16 @@ Some of the main local shapes are:
 - `Spawn.part` -> `Part`
 - `Rig.model` -> `Model`
 - `Viewport.worldmodel` -> `WorldModel`
+- `Hud.screengui` -> `ScreenGui`
+- `Modal.canvasgroup` -> `CanvasGroup`
+- `Inventory.scrollingframe` -> `ScrollingFrame`
+- `Billboard.billboardgui` -> `BillboardGui`
+- `Play.textbutton` -> `TextButton`
+- `Root.frame` -> `Frame`
+- `Corner.uicorner` -> `UICorner`
+- `Surface.texture` -> `Texture`
+- `Sticker.decal` -> `Decal`
+- `Label.stringvalue` -> `StringValue`
 - `Hud.instance.json` -> compact generic subtree
 - `StarterGui.service.json` -> compact top-level service subtree
 
@@ -180,9 +196,33 @@ This header style is supported for:
 
 The file suffix still stays authoritative. For example, `.server.lua` must remain a `Script`, `.re` must remain a `RemoteEvent`, and `.folder` must remain a `Folder`.
 
+Many other fixed-shape typed files currently keep their metadata in `.meta.json` or via a typed container directory.
+
 Legacy `.meta.json` files still parse for compatibility, especially for directory-backed containers.
 
 If you need an arbitrary non-script class that does not have its own dedicated suffix, prefer `.instance.json` or a directory-backed node with legacy `.meta.json`.
+
+### Nested Typed Containers
+
+Child-bearing instances can now live as real nested directories instead of being forced into one flat JSON blob. Common typed container shapes include:
+
+```text
+Workspace/
+  Spawn.part/
+    .meta.json
+    Surface.texture
+
+StarterGui/
+  Hud.screengui/
+    .meta.json
+    Play.textbutton/
+      .meta.json
+      Corner.uicorner
+```
+
+This works well for parts, UI trees, value objects, textures/decals, and similar instance graphs where each child should keep its own properties and metadata.
+
+If a Studio subtree has repeated child names that would map to the same local file path, Nyjo writes that subtree as compact `.instance.json` instead so every child can be preserved.
 
 ### Directory-Backed Scripts
 
@@ -234,6 +274,7 @@ The local files and local parser remain the core model.
 - This is still an early tool and does not claim full Roblox property coverage
 - Round-tripping is strongest for the currently supported file types and translated properties
 - Conflict handling exists, but full two-sided reconciliation is still a work in progress
+- Dedicated `nyjo push`, `nyjo pull`, `nyjo watch`, and `nyjo diff` CLI commands are not implemented yet
 - Auto-install of the plugin currently targets Vinegar-style Linux Studio paths
 
 For a more detailed project status and roadmap, see [TASK.md](TASK.md).
