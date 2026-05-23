@@ -36,11 +36,6 @@ local ROOT_SERVICE_CLASSES = {
 	Workspace = true,
 }
 
-local ADOPTABLE_CLASSES = {
-	StarterCharacterScripts = true,
-	StarterPlayerScripts = true,
-}
-
 local BASE_PART_PROPERTIES = { "Anchored", "CanCollide", "Color", "Material", "Shape", "Size", "Transparency" }
 local VALUE_BASE_PROPERTIES = { "Value" }
 local SCREEN_GUI_PROPERTIES = { "DisplayOrder", "IgnoreGuiInset", "ResetOnSpawn" }
@@ -830,10 +825,6 @@ local function isManaged(instance)
 	return instance:GetAttribute(MANAGED_ATTRIBUTE) == MANAGED_VALUE
 end
 
-local function isAdoptable(node)
-	return ADOPTABLE_CLASSES[node.className] == true
-end
-
 local function summarizeCounters(counters)
 	return string.format(
 		"created=%d\nupdated=%d\ndeleted=%d\nskipped=%d",
@@ -867,11 +858,12 @@ local function applyAttributes(instance, desiredAttributes)
 		for name, value in pairs(desiredAttributes) do
 			local decoded = decodeTypedValue(value)
 			if decoded ~= nil then
+				desired[name] = true
 				local ok = pcall(function()
 					instance:SetAttribute(name, decoded)
 				end)
-				if ok then
-					desired[name] = true
+				if not ok then
+					warn(string.format("Nyjo: skipped protected attribute %s on %s", tostring(name), instance:GetFullName()))
 				end
 			end
 		end
@@ -880,7 +872,12 @@ local function applyAttributes(instance, desiredAttributes)
 	if isManaged(instance) then
 		for name, _ in pairs(instance:GetAttributes()) do
 			if name ~= MANAGED_ATTRIBUTE and not desired[name] then
-				instance:SetAttribute(name, nil)
+				local ok = pcall(function()
+					instance:SetAttribute(name, nil)
+				end)
+				if not ok then
+					warn(string.format("Nyjo: could not clear protected attribute %s on %s", tostring(name), instance:GetFullName()))
+				end
 			end
 		end
 	end
@@ -962,12 +959,12 @@ local syncChildren
 local function resolveOrCreateChild(parent, node, counters)
 	local exact = findExactChild(parent, node)
 	if exact then
-		if isManaged(exact) or isAdoptable(node) then
-			return exact, false
+		-- Exact name/class matches can be adopted incrementally. Only matched
+		-- nodes become managed, so unrelated Studio content stays untouched.
+		if not isManaged(exact) then
+			markManaged(exact)
 		end
-
-		counters.skipped = counters.skipped + 1
-		return nil, "unmanaged collision at " .. parent:GetFullName() .. "." .. node.name
+		return exact, false
 	end
 
 	local instance

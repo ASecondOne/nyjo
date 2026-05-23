@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use axum::extract::State;
+use axum::extract::{DefaultBodyLimit, State};
 use axum::http::StatusCode;
 use axum::response::Html;
 use axum::response::IntoResponse;
@@ -84,6 +84,7 @@ const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
 const LOG_BUFFER_LIMIT: usize = 200;
 const PLUGIN_CONNECTION_TIMEOUT_MS: u64 = 5_000;
 const PLUGIN_SESSION_RETENTION_MS: u64 = 60_000;
+const STUDIO_SYNC_MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 struct DashboardState {
@@ -815,6 +816,7 @@ pub async fn serve(root: PathBuf, port: u16) -> Result<()> {
         .route("/api/plugin/heartbeat", post(plugin_heartbeat))
         .route("/api/plugin/poll", post(plugin_poll))
         .route("/api/plugin/command-result", post(plugin_command_result))
+        .layer(DefaultBodyLimit::max(STUDIO_SYNC_MAX_BODY_BYTES))
         .with_state(AppState {
             root: root.clone(),
             dashboard,
