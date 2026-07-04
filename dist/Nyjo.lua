@@ -1,15 +1,20 @@
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local CollectionService = game:GetService("CollectionService")
 local HttpService = game:GetService("HttpService")
+local MarketplaceService = game:GetService("MarketplaceService")
 
 local TOOLBAR_ID = "NyjoToolbar"
 local BUTTON_ID = "NyjoToggle"
 local WIDGET_ID = "NyjoWidget"
 local SETTINGS_KEY_PORT = "nyjo_port"
+local SETTINGS_KEY_LAST_STUDIO_BACKUP_ID = "nyjo_last_studio_backup_id"
+local SETTINGS_KEY_LAST_STUDIO_BACKUP_PLACE_ID = "nyjo_last_studio_backup_place_id"
+local SETTINGS_KEY_LAST_STUDIO_BACKUP_LABEL = "nyjo_last_studio_backup_label"
 local DEFAULT_PORT = 34872
 local BRIDGE_VERSION = "nyjo-studio-bridge/1"
 local BRIDGE_SESSION_ID = HttpService:GenerateGUID(false)
 local MANAGED_ATTRIBUTE = "NyjoManagedBy"
+local MANAGED_CHILD_KEYS_ATTRIBUTE = "NyjoManagedChildKeys"
 local MANAGED_VALUE = "nyjo"
 local PANEL_COLOR = Color3.fromRGB(28, 30, 36)
 local BORDER_COLOR = Color3.fromRGB(78, 82, 94)
@@ -36,7 +41,38 @@ local ROOT_SERVICE_CLASSES = {
 	Workspace = true,
 }
 
-local BASE_PART_PROPERTIES = { "Anchored", "CanCollide", "Color", "Material", "Shape", "Size", "Transparency" }
+local UNSAFE_CREATE_CLASS_REASONS = {
+	IntersectOperation = "CSG operation geometry does not round-trip safely through Nyjo yet",
+	NegateOperation = "CSG operation geometry does not round-trip safely through Nyjo yet",
+	Terrain = "terrain voxel data does not round-trip safely through Nyjo yet",
+	UnionOperation = "CSG operation geometry does not round-trip safely through Nyjo yet",
+}
+
+local BASE_PART_PROPERTIES = {
+	"Anchored",
+	"BottomSurface",
+	"CanCollide",
+	"CanQuery",
+	"CanTouch",
+	"CastShadow",
+	"CFrame",
+	"CollisionGroup",
+	"Color",
+	"Locked",
+	"Massless",
+	"Material",
+	"MaterialVariant",
+	"PivotOffset",
+	"Reflectance",
+	"Shape",
+	"Size",
+	"TopSurface",
+	"Transparency",
+}
+local MESH_PART_PROPERTIES = { "DoubleSided", "MeshId", "RenderFidelity", "TextureID" }
+local DATA_MODEL_MESH_PROPERTIES = { "Offset", "Scale", "VertexColor" }
+local SPECIAL_MESH_PROPERTIES = { "MeshId", "MeshType", "TextureId" }
+local SURFACE_APPEARANCE_PROPERTIES = { "AlphaMode", "ColorMap", "MetalnessMap", "NormalMap", "RoughnessMap" }
 local VALUE_BASE_PROPERTIES = { "Value" }
 local SCREEN_GUI_PROPERTIES = { "DisplayOrder", "IgnoreGuiInset", "ResetOnSpawn" }
 local GUI_OBJECT_PROPERTIES = {
@@ -93,8 +129,29 @@ local UI_GRID_LAYOUT_PROPERTIES = {
 	"VerticalAlignment",
 }
 local UI_PADDING_PROPERTIES = { "PaddingTop", "PaddingBottom", "PaddingLeft", "PaddingRight" }
-local UI_CORNER_PROPERTIES = { "CornerRadius" }
+local UI_CORNER_SHORTHAND_PROPERTIES = { "CornerRadius" }
+local UI_CORNER_INDIVIDUAL_PROPERTIES = {
+	"TopLeftRadius",
+	"TopRightRadius",
+	"BottomRightRadius",
+	"BottomLeftRadius",
+}
+local UI_CORNER_INDIVIDUAL_PROPERTY_SET = {
+	TopLeftRadius = true,
+	TopRightRadius = true,
+	BottomRightRadius = true,
+	BottomLeftRadius = true,
+}
 local UI_STROKE_PROPERTIES = { "ApplyStrokeMode", "Color", "Thickness", "Transparency" }
+local UI_SHADOW_PROPERTIES = {
+	"BlurRadius",
+	"Color",
+	"Enabled",
+	"Offset",
+	"Spread",
+	"Transparency",
+	"ZIndex",
+}
 local DECAL_PROPERTIES = { "Color3", "Face", "Texture", "Transparency" }
 local TEXTURE_PROPERTIES = { "OffsetStudsU", "OffsetStudsV", "StudsPerTileU", "StudsPerTileV" }
 
@@ -107,7 +164,7 @@ local widgetInfo = DockWidgetPluginGuiInfo.new(
 	true,
 	false,
 	360,
-	340,
+	392,
 	280,
 	240
 )
@@ -279,15 +336,39 @@ forcePullButton.TextSize = 16
 forcePullButton.Text = "Force Pull"
 forcePullButton.Parent = syncRow
 
+local safetyRow = Instance.new("Frame")
+safetyRow.Name = "SafetyButtons"
+safetyRow.LayoutOrder = 7
+safetyRow.BackgroundTransparency = 1
+safetyRow.Size = UDim2.new(1, 0, 0, 32)
+safetyRow.Parent = root
+
+local safetyLayout = Instance.new("UIListLayout")
+safetyLayout.FillDirection = Enum.FillDirection.Horizontal
+safetyLayout.HorizontalAlignment = Enum.HorizontalAlignment.Left
+safetyLayout.Padding = UDim.new(0, 8)
+safetyLayout.Parent = safetyRow
+
+local restoreStudioBackupButton = Instance.new("TextButton")
+restoreStudioBackupButton.Name = "RestoreStudioBackup"
+restoreStudioBackupButton.Size = UDim2.new(0, 180, 1, 0)
+restoreStudioBackupButton.BackgroundColor3 = BUTTON_BG
+restoreStudioBackupButton.BorderColor3 = BORDER_COLOR
+restoreStudioBackupButton.Font = Enum.Font.SourceSansSemibold
+restoreStudioBackupButton.TextColor3 = BUTTON_TEXT
+restoreStudioBackupButton.TextSize = 16
+restoreStudioBackupButton.Text = "Restore Studio Backup"
+restoreStudioBackupButton.Parent = safetyRow
+
 local status = Instance.new("TextBox")
 status.Name = "Status"
-status.LayoutOrder = 7
+status.LayoutOrder = 8
 status.MultiLine = true
 status.ClearTextOnFocus = false
 status.TextEditable = false
 status.BackgroundColor3 = OUTPUT_BG
 status.BorderColor3 = BORDER_COLOR
-status.Size = UDim2.new(1, 0, 0, 180)
+status.Size = UDim2.new(1, 0, 0, 208)
 status.Font = Enum.Font.Code
 status.TextColor3 = PRIMARY_TEXT
 status.TextSize = 15
@@ -330,7 +411,7 @@ local function dashboardUrl()
 	return ("http://127.0.0.1:%d/"):format(readPort())
 end
 
-setStatus("Nyjo Studio bridge ready.\n\nUse the web dashboard at " .. dashboardUrl() .. " to inspect logs, queue Studio work, and review pull plans.\n\nThe buttons here still work as local fallbacks.")
+setStatus("Nyjo Studio bridge ready.\n\nUse the web dashboard at " .. dashboardUrl() .. " to inspect logs, queue Studio work, and review pull plans.\n\nPush now saves a Studio backup first, and Restore Studio Backup can roll the place tree back if a sync goes sideways.")
 
 local function request(path, method, body)
 	local port = savePort()
@@ -555,6 +636,13 @@ local function encodeTypedValue(value)
 		}
 	end
 
+	if valueType == "CFrame" then
+		return {
+			__nyjoType = "CFrame",
+			components = { value:GetComponents() },
+		}
+	end
+
 	if valueType == "UDim" then
 		return {
 			__nyjoType = "UDim",
@@ -610,6 +698,27 @@ local function decodeTypedValue(value)
 		return Vector3.new(tonumber(value.x) or 0, tonumber(value.y) or 0, tonumber(value.z) or 0)
 	end
 
+	if marker == "CFrame" then
+		local components = value.components
+		if typeof(components) ~= "table" or #components < 12 then
+			return nil
+		end
+		return CFrame.new(
+			tonumber(components[1]) or 0,
+			tonumber(components[2]) or 0,
+			tonumber(components[3]) or 0,
+			tonumber(components[4]) or 1,
+			tonumber(components[5]) or 0,
+			tonumber(components[6]) or 0,
+			tonumber(components[7]) or 0,
+			tonumber(components[8]) or 1,
+			tonumber(components[9]) or 0,
+			tonumber(components[10]) or 0,
+			tonumber(components[11]) or 0,
+			tonumber(components[12]) or 1
+		)
+	end
+
 	if marker == "UDim" then
 		return UDim.new(tonumber(value.scale) or 0, tonumber(value.offset) or 0)
 	end
@@ -663,11 +772,27 @@ local function copyProperties(instance, propertyNames, destination)
 	end
 end
 
+local function copyUICornerProperties(instance, destination)
+	copyProperties(instance, UI_CORNER_INDIVIDUAL_PROPERTIES, destination)
+
+	for _, propertyName in ipairs(UI_CORNER_INDIVIDUAL_PROPERTIES) do
+		if destination[propertyName] ~= nil then
+			return
+		end
+	end
+
+	copyProperties(instance, UI_CORNER_SHORTHAND_PROPERTIES, destination)
+end
+
 local function extractStudioProperties(instance)
 	local properties = {}
 
 	if instance:IsA("BasePart") then
 		copyProperties(instance, BASE_PART_PROPERTIES, properties)
+	end
+
+	if instance:IsA("MeshPart") then
+		copyProperties(instance, MESH_PART_PROPERTIES, properties)
 	end
 
 	if instance:IsA("ValueBase") then
@@ -711,11 +836,15 @@ local function extractStudioProperties(instance)
 	end
 
 	if instance:IsA("UICorner") then
-		copyProperties(instance, UI_CORNER_PROPERTIES, properties)
+		copyUICornerProperties(instance, properties)
 	end
 
 	if instance:IsA("UIStroke") then
 		copyProperties(instance, UI_STROKE_PROPERTIES, properties)
+	end
+
+	if instance:IsA("UIShadow") then
+		copyProperties(instance, UI_SHADOW_PROPERTIES, properties)
 	end
 
 	if instance:IsA("Decal") or instance:IsA("Texture") then
@@ -724,6 +853,18 @@ local function extractStudioProperties(instance)
 
 	if instance:IsA("Texture") then
 		copyProperties(instance, TEXTURE_PROPERTIES, properties)
+	end
+
+	if instance:IsA("DataModelMesh") then
+		copyProperties(instance, DATA_MODEL_MESH_PROPERTIES, properties)
+	end
+
+	if instance:IsA("SpecialMesh") then
+		copyProperties(instance, SPECIAL_MESH_PROPERTIES, properties)
+	end
+
+	if instance:IsA("SurfaceAppearance") then
+		copyProperties(instance, SURFACE_APPEARANCE_PROPERTIES, properties)
 	end
 
 	return properties
@@ -765,13 +906,35 @@ local function normalizeTags(tags)
 	return result
 end
 
+local function isInternalManagedAttribute(name)
+	return name == MANAGED_ATTRIBUTE or name == MANAGED_CHILD_KEYS_ATTRIBUTE
+end
+
+local function sanitizeSnapshotAttributes(attributes)
+	local result = {}
+	if typeof(attributes) ~= "table" then
+		return result
+	end
+
+	for name, value in pairs(attributes) do
+		if typeof(name) == "string" and not isInternalManagedAttribute(name) then
+			local encoded = encodeTypedValue(value)
+			if encoded ~= nil then
+				result[name] = encoded
+			end
+		end
+	end
+
+	return result
+end
+
 local function snapshotStudioNode(instance)
 	local node = {
 		name = instance.Name,
 		className = instance.ClassName,
 		children = {},
 		properties = normalizeDictionary(extractStudioProperties(instance)),
-		attributes = normalizeDictionary(instance:GetAttributes()),
+		attributes = sanitizeSnapshotAttributes(instance:GetAttributes()),
 		tags = normalizeTags(CollectionService:GetTags(instance)),
 	}
 
@@ -852,6 +1015,15 @@ local function safeSetProperty(instance, propertyName, value)
 	return ok
 end
 
+local function applyPropertyMap(instance, propertyMap, propertyNames)
+	for _, propertyName in ipairs(propertyNames) do
+		local value = propertyMap[propertyName]
+		if value ~= nil then
+			safeSetProperty(instance, propertyName, value)
+		end
+	end
+end
+
 local function applyAttributes(instance, desiredAttributes)
 	local desired = {}
 	if typeof(desiredAttributes) == "table" then
@@ -871,7 +1043,7 @@ local function applyAttributes(instance, desiredAttributes)
 
 	if isManaged(instance) then
 		for name, _ in pairs(instance:GetAttributes()) do
-			if name ~= MANAGED_ATTRIBUTE and not desired[name] then
+			if not isInternalManagedAttribute(name) and not desired[name] then
 				local ok = pcall(function()
 					instance:SetAttribute(name, nil)
 				end)
@@ -909,8 +1081,19 @@ end
 
 local function applyProperties(instance, node)
 	if typeof(node.properties) == "table" then
-		for propertyName, value in pairs(node.properties) do
-			safeSetProperty(instance, propertyName, value)
+		if instance:IsA("UICorner") then
+			applyPropertyMap(instance, node.properties, UI_CORNER_SHORTHAND_PROPERTIES)
+			applyPropertyMap(instance, node.properties, UI_CORNER_INDIVIDUAL_PROPERTIES)
+
+			for propertyName, value in pairs(node.properties) do
+				if propertyName ~= "CornerRadius" and not UI_CORNER_INDIVIDUAL_PROPERTY_SET[propertyName] then
+					safeSetProperty(instance, propertyName, value)
+				end
+			end
+		else
+			for propertyName, value in pairs(node.properties) do
+				safeSetProperty(instance, propertyName, value)
+			end
 		end
 	end
 
@@ -935,6 +1118,88 @@ end
 
 local function markManaged(instance)
 	instance:SetAttribute(MANAGED_ATTRIBUTE, MANAGED_VALUE)
+end
+
+local function readManagedChildKeys(parent)
+	local result = {}
+	local raw = parent:GetAttribute(MANAGED_CHILD_KEYS_ATTRIBUTE)
+	if typeof(raw) ~= "string" or raw == "" then
+		return result
+	end
+
+	local ok, decoded = pcall(function()
+		return HttpService:JSONDecode(raw)
+	end)
+	if not ok or typeof(decoded) ~= "table" then
+		return result
+	end
+
+	for _, key in ipairs(decoded) do
+		if typeof(key) == "string" then
+			result[key] = true
+		end
+	end
+
+	return result
+end
+
+local function saveStudioBackupMarker(backup)
+	if typeof(backup) ~= "table" or typeof(backup.id) ~= "string" or backup.id == "" then
+		return
+	end
+
+	plugin:SetSetting(SETTINGS_KEY_LAST_STUDIO_BACKUP_ID, backup.id)
+
+	local placeId = backup.placeId
+	if typeof(placeId) == "number" and placeId > 0 then
+		plugin:SetSetting(SETTINGS_KEY_LAST_STUDIO_BACKUP_PLACE_ID, placeId)
+	else
+		plugin:SetSetting(SETTINGS_KEY_LAST_STUDIO_BACKUP_PLACE_ID, nil)
+	end
+
+	local label = backup.label
+	if typeof(label) == "string" and label ~= "" then
+		plugin:SetSetting(SETTINGS_KEY_LAST_STUDIO_BACKUP_LABEL, label)
+	else
+		plugin:SetSetting(SETTINGS_KEY_LAST_STUDIO_BACKUP_LABEL, backup.id)
+	end
+end
+
+local function readStudioBackupMarker()
+	local backupId = plugin:GetSetting(SETTINGS_KEY_LAST_STUDIO_BACKUP_ID)
+	if typeof(backupId) ~= "string" or backupId == "" then
+		return nil
+	end
+
+	local placeId = plugin:GetSetting(SETTINGS_KEY_LAST_STUDIO_BACKUP_PLACE_ID)
+	local label = plugin:GetSetting(SETTINGS_KEY_LAST_STUDIO_BACKUP_LABEL)
+	return {
+		id = backupId,
+		placeId = typeof(placeId) == "number" and placeId or nil,
+		label = typeof(label) == "string" and label ~= "" and label or backupId,
+	}
+end
+
+local function writeManagedChildKeys(parent, desiredChildren)
+	local keys = {}
+	if typeof(desiredChildren) == "table" then
+		for _, node in ipairs(desiredChildren) do
+			table.insert(keys, nodeKey(node.name, node.className))
+		end
+	end
+
+	table.sort(keys)
+
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(keys)
+	end)
+	if not ok then
+		return
+	end
+
+	pcall(function()
+		parent:SetAttribute(MANAGED_CHILD_KEYS_ATTRIBUTE, encoded)
+	end)
 end
 
 local function buildDesiredMap(children)
@@ -967,6 +1232,17 @@ local function resolveOrCreateChild(parent, node, counters)
 		return exact, false
 	end
 
+	local unsafeReason = UNSAFE_CREATE_CLASS_REASONS[node.className]
+	if typeof(unsafeReason) == "string" and unsafeReason ~= "" then
+		counters.skipped = counters.skipped + 1
+		return nil, string.format(
+			"Nyjo refused to create %s %s: %s",
+			tostring(node.className),
+			tostring(node.name),
+			unsafeReason
+		)
+	end
+
 	local instance
 	local ok, createError = pcall(function()
 		instance = Instance.new(node.className)
@@ -985,6 +1261,7 @@ end
 
 syncChildren = function(parent, desiredChildren, counters, warnings)
 	local desiredByKey, desiredKeys = buildDesiredMap(desiredChildren)
+	local previousManagedKeys = readManagedChildKeys(parent)
 
 	for key, node in pairs(desiredByKey) do
 		local instance, createdOrError, maybeError = resolveOrCreateChild(parent, node, counters)
@@ -1009,15 +1286,20 @@ syncChildren = function(parent, desiredChildren, counters, warnings)
 		end
 	end
 
+	-- Only delete child keys that Nyjo itself synced on an earlier push. This
+	-- preserves manual Studio duplicates/build-outs that may inherit Nyjo's
+	-- managed marker from cloned instances.
 	for _, child in ipairs(parent:GetChildren()) do
 		if isManaged(child) then
 			local key = nodeKey(child.Name, child.ClassName)
-			if not desiredKeys[key] then
+			if previousManagedKeys[key] and not desiredKeys[key] then
 				child:Destroy()
 				counters.deleted = counters.deleted + 1
 			end
 		end
 	end
+
+	writeManagedChildKeys(parent, desiredChildren)
 end
 
 local function resolveService(node)
@@ -1036,7 +1318,29 @@ local function resolveService(node)
 	return service
 end
 
-local function pushTree(tree, updateStatus)
+local function buildPushMessage(headline, counters, warnings, notes)
+	local message = headline .. "\n\n" .. summarizeCounters(counters)
+
+	local noteLines = {}
+	if typeof(notes) == "table" then
+		for _, note in ipairs(notes) do
+			if typeof(note) == "string" and note ~= "" then
+				table.insert(noteLines, note)
+			end
+		end
+	end
+	if #noteLines > 0 then
+		message = message .. "\n\n" .. table.concat(noteLines, "\n")
+	end
+
+	if #warnings > 0 then
+		message = message .. "\n\nWarnings:\n- " .. table.concat(warnings, "\n- ")
+	end
+
+	return message
+end
+
+local function pushTree(tree, updateStatus, options)
 	if typeof(tree) ~= "table" then
 		error("server response did not contain a tree")
 	end
@@ -1061,10 +1365,30 @@ local function pushTree(tree, updateStatus)
 	end
 	ChangeHistoryService:SetWaypoint("Nyjo Push End")
 
-	local message = "Push complete.\n\n" .. summarizeCounters(counters)
-	if #warnings > 0 then
-		message = message .. "\n\nWarnings:\n- " .. table.concat(warnings, "\n- ")
+	local notes = {}
+	if typeof(options) == "table" then
+		local backup = options.backup
+		if typeof(backup) == "table" then
+			table.insert(notes, "Studio backup saved: " .. tostring(backup.label or backup.id or "unknown"))
+		end
+
+		local restoredBackup = options.restoredBackup
+		if typeof(restoredBackup) == "table" then
+			table.insert(notes, "Restored Studio from: " .. tostring(restoredBackup.label or restoredBackup.id or "unknown"))
+		end
+
+		local rescueBackup = options.rescueBackup
+		if typeof(rescueBackup) == "table" then
+			table.insert(notes, "Current Studio state rescued as: " .. tostring(rescueBackup.label or rescueBackup.id or "unknown"))
+		end
 	end
+
+	local headline = "Push complete."
+	if typeof(options) == "table" and typeof(options.headline) == "string" and options.headline ~= "" then
+		headline = options.headline
+	end
+
+	local message = buildPushMessage(headline, counters, warnings, notes)
 	if updateStatus ~= false then
 		setStatus(message)
 	end
@@ -1073,6 +1397,63 @@ local function pushTree(tree, updateStatus)
 		counters = counters,
 		warnings = warnings,
 	}
+end
+
+local function createStudioBackup(reason, tree, remember)
+	local response = postJson("/api/backups/studio/create", {
+		sessionId = BRIDGE_SESSION_ID,
+		placeName = resolveBridgePlaceName(),
+		placeId = game.PlaceId ~= 0 and game.PlaceId or nil,
+		reason = reason,
+		tree = tree,
+	})
+	local backup = response and response.data and response.data.backup
+	if typeof(backup) ~= "table" or typeof(backup.id) ~= "string" or backup.id == "" then
+		error("server response did not contain a Studio backup")
+	end
+
+	if remember ~= false then
+		saveStudioBackupMarker(backup)
+	end
+
+	return backup
+end
+
+local function pushLocalTree(updateStatus)
+	local studioTree = captureStudioTree()
+	local backup = createStudioBackup("before push local tree", studioTree, true)
+	local decoded = fetchJson("/api/tree")
+	local tree = decoded and decoded.data and decoded.data.tree
+	return pushTree(tree, updateStatus, {
+		backup = backup,
+	})
+end
+
+local function restoreStudioBackup(updateStatus)
+	local savedBackup = readStudioBackupMarker()
+	if savedBackup == nil then
+		error("no saved Studio backup is available yet; push to Studio once first")
+	end
+
+	if typeof(savedBackup.placeId) == "number" and savedBackup.placeId > 0 and game.PlaceId ~= 0 and savedBackup.placeId ~= game.PlaceId then
+		error("the saved Studio backup belongs to a different place; open the matching place or create a fresh backup here first")
+	end
+
+	local rescueBackup = createStudioBackup("before restoring studio backup", captureStudioTree(), false)
+	local response = postJson("/api/backups/studio/read", {
+		backupId = savedBackup.id,
+	})
+	local data = response and response.data or {}
+	local tree = data.tree
+	if typeof(tree) ~= "table" then
+		error("backup response did not contain a tree")
+	end
+
+	return pushTree(tree, updateStatus, {
+		headline = "Studio restore complete.",
+		restoredBackup = data.backup,
+		rescueBackup = rescueBackup,
+	})
 end
 
 local function syncFromStudio(mode, force, updateStatus)
@@ -1138,6 +1519,14 @@ local function syncFromStudio(mode, force, updateStatus)
 		message = message .. "\n\nConflicts:\n" .. formatConflictLines(plan.conflicts, 8)
 	end
 
+	local backup = data.backup
+	if typeof(backup) == "table" then
+		message = message .. "\n\nLocal backup saved: " .. tostring(backup.label or backup.id or "unknown")
+		if typeof(backup.restoreHint) == "string" and backup.restoreHint ~= "" then
+			message = message .. "\nRestore: " .. backup.restoreHint
+		end
+	end
+
 	if data.blocked then
 		message = message .. "\n\nUse Force Pull after reviewing the conflicts if you want Studio to win."
 	end
@@ -1157,6 +1546,52 @@ local bridgeState = {
 	lastError = nil,
 }
 
+local placeInfoCache = {
+	placeId = nil,
+	resolvedName = nil,
+	lastAttempt = 0,
+}
+
+local function resolveBridgePlaceName()
+	local placeId = game.PlaceId
+	local fallbackName = game.Name
+	if placeId == 0 then
+		return fallbackName
+	end
+
+	if placeInfoCache.placeId ~= placeId then
+		placeInfoCache.placeId = placeId
+		placeInfoCache.resolvedName = nil
+		placeInfoCache.lastAttempt = 0
+	end
+
+	if typeof(placeInfoCache.resolvedName) == "string" and placeInfoCache.resolvedName ~= "" then
+		return placeInfoCache.resolvedName
+	end
+
+	local now = tick()
+	if now - placeInfoCache.lastAttempt < 30 then
+		return fallbackName
+	end
+	placeInfoCache.lastAttempt = now
+
+	local getProductInfo = MarketplaceService.GetProductInfoAsync or MarketplaceService.GetProductInfo
+	if getProductInfo == nil then
+		return fallbackName
+	end
+
+	local ok, info = pcall(getProductInfo, MarketplaceService, placeId, Enum.InfoType.Asset)
+	if ok and typeof(info) == "table" then
+		local name = info.Name
+		if typeof(name) == "string" and name ~= "" then
+			placeInfoCache.resolvedName = name
+			return name
+		end
+	end
+
+	return fallbackName
+end
+
 local function reportBridgeHeartbeat()
 	local heartbeatStatus = bridgeState.status
 	if bridgeState.lastError ~= nil then
@@ -1166,7 +1601,7 @@ local function reportBridgeHeartbeat()
 	return tryPostJson("/api/plugin/heartbeat", {
 		sessionId = BRIDGE_SESSION_ID,
 		bridgeVersion = BRIDGE_VERSION,
-		placeName = game.Name,
+		placeName = resolveBridgePlaceName(),
 		placeId = game.PlaceId ~= 0 and game.PlaceId or nil,
 		status = heartbeatStatus,
 	})
@@ -1186,9 +1621,7 @@ end
 local function executeBridgeCommand(command)
 	local kind = command and command.kind
 	if kind == "pushLocalTree" then
-		local decoded = fetchJson("/api/tree")
-		local tree = decoded and decoded.data and decoded.data.tree
-		local result = pushTree(tree, true)
+		local result = pushLocalTree(true)
 		return true, "Push complete", result.message, {
 			counters = result.counters,
 			warnings = result.warnings,
@@ -1328,9 +1761,13 @@ treeButton.MouseButton1Click:Connect(function()
 end)
 
 pushButton.MouseButton1Click:Connect(function()
-	handleRequest("Push", "/api/tree", function(decoded)
-		pushTree(decoded and decoded.data and decoded.data.tree)
+	local ok, result = pcall(function()
+		return pushLocalTree(true)
 	end)
+
+	if not ok then
+		setStatus("Push failed.\n\n" .. tostring(result))
+	end
 end)
 
 previewPullButton.MouseButton1Click:Connect(function()
@@ -1360,6 +1797,16 @@ forcePullButton.MouseButton1Click:Connect(function()
 
 	if not ok then
 		setStatus("Force Pull failed.\n\n" .. tostring(result))
+	end
+end)
+
+restoreStudioBackupButton.MouseButton1Click:Connect(function()
+	local ok, result = pcall(function()
+		return restoreStudioBackup(true)
+	end)
+
+	if not ok then
+		setStatus("Restore Studio Backup failed.\n\n" .. tostring(result))
 	end
 end)
 

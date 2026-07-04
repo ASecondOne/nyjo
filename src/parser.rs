@@ -9,7 +9,7 @@ use serde_json::Value;
 
 use crate::model::{InstanceNode, NodeMetadata, SourceKind};
 
-const TOP_LEVEL_SERVICES: &[&str] = &[
+pub const ROOT_SERVICE_CLASSES: &[&str] = &[
     "Lighting",
     "ReplicatedFirst",
     "ReplicatedStorage",
@@ -34,6 +34,7 @@ const DIRECTORY_SCRIPT_SOURCE_FILES: &[(&str, &str)] = &[
     ("LocalScript", "init.client.lua"),
     ("ModuleScript", "init.lua"),
 ];
+const DIRECTORY_HEADER_FILE_NAME: &str = ".nyjo";
 const EMBEDDED_HEADER_MARKER: &str = "--!nyjo";
 const EMBEDDED_HEADER_START: &str = "--HEADER";
 const EMBEDDED_CONTENTS_START: &str = "--CONTENTS";
@@ -168,6 +169,11 @@ const EXTENSION_SPECS: &[ExtensionSpec] = &[
     ExtensionSpec {
         suffix: ".uistroke",
         default_class: "UIStroke",
+        payload: PayloadKind::Empty,
+    },
+    ExtensionSpec {
+        suffix: ".uishadow",
+        default_class: "UIShadow",
         payload: PayloadKind::Empty,
     },
     ExtensionSpec {
@@ -400,17 +406,21 @@ impl ParseContext {
                     .unwrap_or("Folder")
                     .to_string()
             });
+        let header_file_name = directory_header_init_file_name(typed_directory, &base_class_name);
+        let header_file_path = header_file_name.as_ref().map(|name| path.join(name));
+        let header_file_exists = header_file_path.as_ref().is_some_and(|file| file.is_file());
         let mut class_name = metadata
             .as_ref()
             .and_then(|metadata| metadata.class_name.clone())
-            .unwrap_or(base_class_name);
+            .unwrap_or(base_class_name.clone());
 
-        let source_file = if typed_directory.is_none() {
+        let source_file = if typed_directory.is_none() && !header_file_exists {
             detect_directory_source_file(path, Some(&class_name))?
         } else {
             None
         };
         if metadata.is_none()
+            && !header_file_exists
             && let Some((detected_class_name, _)) = source_file
         {
             class_name = detected_class_name.to_string();
@@ -425,6 +435,19 @@ impl ParseContext {
         );
 
         let mut skip_names = HashSet::new();
+        let mut expected_header_class = None;
+        if let Some(header_file_name) = header_file_name
+            && let Some(header_file_path) = header_file_path
+            && header_file_exists
+        {
+            ensure_no_directory_script_init_files(path, &header_file_name)?;
+            if let Some(embedded_metadata) = read_embedded_metadata_only_file(&header_file_path)? {
+                node.apply_metadata(embedded_metadata);
+            }
+            skip_names.insert(header_file_name);
+            expected_header_class = Some((header_file_path, base_class_name.clone()));
+        }
+
         if let Some((detected_class_name, source_file_name)) = source_file {
             let source_path = path.join(source_file_name);
             let raw_source = fs::read_to_string(&source_path).with_context(|| {
@@ -458,6 +481,13 @@ impl ParseContext {
                 source_file_name,
                 &node.class_name,
                 detected_class_name,
+            )?;
+        }
+        if let Some((header_file_path, expected_class_name)) = expected_header_class {
+            validate_fixed_directory_header_class(
+                &header_file_path,
+                &node.class_name,
+                &expected_class_name,
             )?;
         }
         if let Some(expected_class_name) = fixed_directory_class {
@@ -620,6 +650,11 @@ impl IgnoreMatcher {
 }
 
 fn load_directory_metadata(directory: &Path) -> Result<Option<NodeMetadata>> {
+    let embedded_metadata_path = directory.join(DIRECTORY_HEADER_FILE_NAME);
+    if embedded_metadata_path.exists() {
+        return read_embedded_metadata_only_file(&embedded_metadata_path);
+    }
+
     let metadata_path = directory.join(".meta.json");
     load_metadata_path(&metadata_path)
 }
@@ -656,6 +691,18 @@ fn load_metadata_path(path: &Path) -> Result<Option<NodeMetadata>> {
     let metadata = serde_json::from_str::<NodeMetadata>(&contents)
         .with_context(|| format!("failed to parse metadata file {}", path.display()))?;
     Ok(Some(metadata))
+}
+
+fn normalize_metadata(metadata: NodeMetadata) -> Option<NodeMetadata> {
+    if metadata.class_name.is_none()
+        && metadata.properties.is_empty()
+        && metadata.attributes.is_empty()
+        && metadata.tags.is_empty()
+    {
+        return None;
+    }
+
+    Some(metadata)
 }
 
 fn parse_embedded_text_payload(path: &Path, raw_contents: &str) -> Result<EmbeddedTextPayload> {
@@ -743,6 +790,30 @@ fn parse_embedded_text_payload(path: &Path, raw_contents: &str) -> Result<Embedd
 
 pub fn read_embedded_text_payload(path: &Path, raw_contents: &str) -> Result<EmbeddedTextPayload> {
     parse_embedded_text_payload(path, raw_contents)
+}
+
+fn read_embedded_metadata_only_file(path: &Path) -> Result<Option<NodeMetadata>> {
+    let raw_contents = fs::read_to_string(path)
+        .with_context(|| format!("failed to read metadata file {}", path.display()))?;
+    let parsed_payload = parse_embedded_text_payload(path, &raw_contents)?;
+    if !parsed_payload.has_header {
+        bail!(
+            "directory metadata file {} must start with {}",
+            path.display(),
+            EMBEDDED_HEADER_MARKER
+        );
+    }
+    if !parsed_payload.contents.trim().is_empty() {
+        bail!(
+            "directory metadata file {} cannot store body contents after {}",
+            path.display(),
+            EMBEDDED_CONTENTS_START
+        );
+    }
+
+    Ok(normalize_metadata(
+        parsed_payload.metadata.unwrap_or_default(),
+    ))
 }
 
 fn parse_json_value(path: &Path, contents: &str) -> Result<Value> {
@@ -928,6 +999,21 @@ fn typed_directory_spec(file_name: &str) -> Option<&'static ExtensionSpec> {
     })
 }
 
+fn directory_header_init_file_name(
+    typed_directory: Option<&ExtensionSpec>,
+    base_class_name: &str,
+) -> Option<String> {
+    if let Some(spec) = typed_directory {
+        return Some(format!("init{}", spec.suffix));
+    }
+
+    if base_class_name == "Folder" {
+        return Some("init.folder".to_string());
+    }
+
+    None
+}
+
 fn expected_fixed_class_for_file(spec: &ExtensionSpec, node_name: &str) -> Option<String> {
     match spec.payload {
         PayloadKind::InstanceJson => None,
@@ -988,6 +1074,23 @@ fn validate_fixed_directory_class(
         "directory {} uses fixed suffix {} and cannot declare className {}; expected {}",
         path.display(),
         suffix,
+        actual_class_name,
+        expected_class_name
+    )
+}
+
+fn validate_fixed_directory_header_class(
+    path: &Path,
+    actual_class_name: &str,
+    expected_class_name: &str,
+) -> Result<()> {
+    if actual_class_name == expected_class_name {
+        return Ok(());
+    }
+
+    bail!(
+        "directory header file {} cannot declare className {}; expected {}",
+        path.display(),
         actual_class_name,
         expected_class_name
     )
@@ -1077,12 +1180,31 @@ fn detect_directory_source_file(
     }
 }
 
+fn ensure_no_directory_script_init_files(directory: &Path, self_file_name: &str) -> Result<()> {
+    let script_inits = DIRECTORY_SCRIPT_SOURCE_FILES
+        .iter()
+        .map(|(_, source_file_name)| *source_file_name)
+        .filter(|source_file_name| directory.join(source_file_name).is_file())
+        .collect::<Vec<_>>();
+
+    if script_inits.is_empty() {
+        return Ok(());
+    }
+
+    bail!(
+        "directory {} uses {} and cannot also contain script init file(s): {}",
+        directory.display(),
+        self_file_name,
+        script_inits.join(", ")
+    )
+}
+
 fn special_directory_class<'a>(
     parent_class: Option<&str>,
     top_level: bool,
     name: &'a str,
 ) -> Option<&'a str> {
-    if top_level && TOP_LEVEL_SERVICES.contains(&name) {
+    if top_level && ROOT_SERVICE_CLASSES.contains(&name) {
         return Some(name);
     }
 
@@ -1097,7 +1219,10 @@ fn special_directory_class<'a>(
 }
 
 fn should_skip_special_file(name: &str) -> bool {
-    name == ".nyjoignore" || name == ".meta.json" || name.ends_with(".meta.json")
+    name == ".nyjoignore"
+        || name == DIRECTORY_HEADER_FILE_NAME
+        || name == ".meta.json"
+        || name.ends_with(".meta.json")
 }
 
 fn file_name(path: &Path) -> Result<String> {
@@ -1146,6 +1271,7 @@ mod tests {
     use std::path::Path;
 
     use anyhow::Result;
+    use serde_json::json;
     use tempfile::tempdir;
 
     use super::scan_project;
@@ -1742,26 +1868,61 @@ print("boot")"#,
         let dir = tempdir()?;
         write_file(
             dir.path(),
-            "StarterGui/Hud.screengui/.meta.json",
-            r#"{
-  "properties": {
-    "ResetOnSpawn": false
-  }
-}"#,
+            "StarterGui/Hud.screengui/init.screengui",
+            r#"--!nyjo
+--HEADER
+--{
+--  "properties": {
+--    "ResetOnSpawn": false
+--  }
+--}
+--CONTENTS
+"#,
         )?;
         write_file(
             dir.path(),
-            "StarterGui/Hud.screengui/Play.textbutton/.meta.json",
-            r#"{
-  "properties": {
-    "Text": "Play"
-  }
-}"#,
+            "StarterGui/Hud.screengui/Play.textbutton/init.textbutton",
+            r#"--!nyjo
+--HEADER
+--{
+--  "properties": {
+--    "Text": "Play"
+--  }
+--}
+--CONTENTS
+"#,
         )?;
         write_file(
             dir.path(),
             "StarterGui/Hud.screengui/Play.textbutton/Corner.uicorner",
-            "",
+            r#"--!nyjo
+--HEADER
+--{
+--  "properties": {
+--    "TopLeftRadius": { "__nyjoType": "UDim", "scale": 0, "offset": 0 },
+--    "TopRightRadius": { "__nyjoType": "UDim", "scale": 0, "offset": 12 },
+--    "BottomRightRadius": { "__nyjoType": "UDim", "scale": 0.25, "offset": 0 },
+--    "BottomLeftRadius": { "__nyjoType": "UDim", "scale": 0, "offset": 4 }
+--  }
+--}
+--CONTENTS
+"#,
+        )?;
+        write_file(
+            dir.path(),
+            "StarterGui/Hud.screengui/Play.textbutton/Shadow.uishadow",
+            r#"--!nyjo
+--HEADER
+--{
+--  "properties": {
+--    "BlurRadius": { "__nyjoType": "UDim", "scale": 0, "offset": 18 },
+--    "Color": { "__nyjoType": "Color3", "r": 0.1, "g": 0.1, "b": 0.12 },
+--    "Enabled": true,
+--    "Transparency": 0.35
+--  }
+--}
+--CONTENTS
+"#,
         )?;
 
         let tree = scan_project(dir.path())?;
@@ -1784,6 +1945,66 @@ print("boot")"#,
 
         let corner = child(play, "Corner");
         assert_eq!(corner.class_name, "UICorner");
+        assert_eq!(
+            corner.properties.get("TopRightRadius"),
+            Some(&json!({
+                "__nyjoType": "UDim",
+                "scale": 0,
+                "offset": 12
+            }))
+        );
+
+        let shadow = child(play, "Shadow");
+        assert_eq!(shadow.class_name, "UIShadow");
+        assert_eq!(
+            shadow.properties.get("BlurRadius"),
+            Some(&json!({
+                "__nyjoType": "UDim",
+                "scale": 0,
+                "offset": 18
+            }))
+        );
+        assert_eq!(
+            shadow
+                .properties
+                .get("Enabled")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+
+        Ok(())
+    }
+
+    #[test]
+    fn parses_generic_directory_nyjo_header() -> Result<()> {
+        let dir = tempdir()?;
+        write_file(
+            dir.path(),
+            "Workspace/Quest/.nyjo",
+            r#"--!nyjo
+--HEADER
+--{
+--  "attributes": {
+--    "Stage": "Lobby"
+--  },
+--  "tags": ["Tracked"]
+--}
+--CONTENTS
+"#,
+        )?;
+
+        let tree = scan_project(dir.path())?;
+        let workspace = child(&tree, "Workspace");
+        let quest = child(workspace, "Quest");
+        assert_eq!(quest.class_name, "Folder");
+        assert_eq!(
+            quest
+                .attributes
+                .get("Stage")
+                .and_then(|value| value.as_str()),
+            Some("Lobby")
+        );
+        assert_eq!(quest.tags, vec!["Tracked".to_string()]);
 
         Ok(())
     }

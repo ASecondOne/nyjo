@@ -16,28 +16,25 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 
+use crate::backup::{
+    BackupRecord, StudioBackupIdentity, create_local_project_backup, create_studio_tree_backup,
+    read_studio_tree_backup,
+};
+use crate::control::{
+    BridgeCommandEnvelope, BridgeCommandKind, BridgeCommandResult, BridgeCommandState,
+    BridgePlacesSnapshot, BridgeSessionSnapshot, QueueBridgeCommandRequest,
+    QueueBridgeCommandResponse, SelectBridgeSessionRequest, SelectBridgeSessionResponse,
+};
 use crate::model::{InstanceNode, NodeMetadata};
-use crate::parser::{metadata_path_for_target, read_embedded_text_payload, scan_project};
+use crate::parser::{
+    ROOT_SERVICE_CLASSES, metadata_path_for_target, read_embedded_text_payload, scan_project,
+};
 
 #[derive(Clone)]
 struct AppState {
     root: PathBuf,
     dashboard: Arc<Mutex<DashboardState>>,
 }
-
-const SUPPORTED_ROOT_SERVICE_CLASSES: &[&str] = &[
-    "Lighting",
-    "ReplicatedFirst",
-    "ReplicatedStorage",
-    "ServerScriptService",
-    "ServerStorage",
-    "SoundService",
-    "StarterGui",
-    "StarterPlayer",
-    "Teams",
-    "TextChatService",
-    "Workspace",
-];
 
 const LOGICAL_NODE_FILE_SUFFIXES: &[&str] = &[
     ".server.lua",
@@ -64,6 +61,7 @@ const LOGICAL_NODE_FILE_SUFFIXES: &[&str] = &[
     ".uipadding",
     ".uicorner",
     ".uistroke",
+    ".uishadow",
     ".texture",
     ".decal",
     ".stringvalue",
@@ -81,6 +79,7 @@ const LOGICAL_NODE_FILE_SUFFIXES: &[&str] = &[
 ];
 
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
+const DIRECTORY_HEADER_FILE_NAME: &str = ".nyjo";
 const LOG_BUFFER_LIMIT: usize = 200;
 const PLUGIN_CONNECTION_TIMEOUT_MS: u64 = 5_000;
 const PLUGIN_SESSION_RETENTION_MS: u64 = 60_000;
@@ -89,11 +88,11 @@ const STUDIO_SYNC_MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
 #[derive(Debug, Default)]
 struct DashboardState {
     next_command_id: u64,
-    pending_command: Option<PluginCommandEnvelope>,
-    active_command: Option<PluginCommandEnvelope>,
+    pending_command: Option<BridgeCommandEnvelope>,
+    active_command: Option<BridgeCommandEnvelope>,
     sessions: BTreeMap<String, BridgeSessionRecord>,
     selected_session_id: Option<String>,
-    last_result: Option<PluginCommandResultRecord>,
+    last_result: Option<BridgeCommandResult>,
     logs: Vec<DashboardLogEntry>,
 }
 
@@ -107,53 +106,12 @@ struct BridgeSessionRecord {
     last_seen_ms: u64,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "camelCase")]
-enum PluginCommandKind {
-    PushLocalTree,
-    PreviewPull,
-    ApplyPull,
-    ForcePull,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PluginCommandEnvelope {
-    id: u64,
-    kind: PluginCommandKind,
-    requested_at_ms: u64,
-    target_session_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target_place_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target_place_id: Option<u64>,
-}
-
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct DashboardLogEntry {
     timestamp_ms: u64,
     level: String,
     message: String,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct PluginCommandResultRecord {
-    command_id: u64,
-    kind: PluginCommandKind,
-    target_session_id: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target_place_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    target_place_id: Option<u64>,
-    ok: bool,
-    summary: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    detail: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    data: Option<Value>,
-    finished_at_ms: u64,
 }
 
 #[derive(Debug, Serialize)]
@@ -166,7 +124,7 @@ struct DashboardPluginSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     target_session_id: Option<String>,
     selection_required: bool,
-    sessions: Vec<DashboardBridgeSessionSnapshot>,
+    sessions: Vec<BridgeSessionSnapshot>,
     #[serde(skip_serializing_if = "Option::is_none")]
     bridge_version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -174,26 +132,9 @@ struct DashboardPluginSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     last_seen_ms: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pending_command: Option<PluginCommandEnvelope>,
+    pending_command: Option<BridgeCommandEnvelope>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    active_command: Option<PluginCommandEnvelope>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct DashboardBridgeSessionSnapshot {
-    session_id: String,
-    connected: bool,
-    selected: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    bridge_version: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    place_name: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    place_id: Option<u64>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    status: Option<String>,
-    last_seen_ms: u64,
+    active_command: Option<BridgeCommandEnvelope>,
 }
 
 #[derive(Debug, Serialize)]
@@ -202,23 +143,8 @@ struct DashboardSnapshot {
     server: Value,
     plugin: DashboardPluginSnapshot,
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_result: Option<PluginCommandResultRecord>,
+    last_result: Option<BridgeCommandResult>,
     logs: Vec<DashboardLogEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DashboardCommandRequest {
-    kind: PluginCommandKind,
-    #[serde(default)]
-    target_session_id: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct DashboardSelectSessionRequest {
-    #[serde(default)]
-    session_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -296,7 +222,26 @@ struct StudioSyncRequest {
     force: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StudioBackupCreateRequest {
+    session_id: String,
+    #[serde(default)]
+    place_name: Option<String>,
+    #[serde(default)]
+    place_id: Option<u64>,
+    #[serde(default)]
+    reason: Option<String>,
+    tree: StudioNode,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StudioBackupReadRequest {
+    backup_id: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 struct StudioNode {
     name: String,
@@ -373,6 +318,8 @@ struct StudioSyncResponse {
     blocked: bool,
     plan: StudioSyncPlan,
     #[serde(skip_serializing_if = "Option::is_none")]
+    backup: Option<BackupRecord>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     tree: Option<InstanceNode>,
 }
 
@@ -392,17 +339,6 @@ enum PendingWrite {
     RemoveDirectory {
         path: PathBuf,
     },
-}
-
-impl PluginCommandKind {
-    fn label(self) -> &'static str {
-        match self {
-            Self::PushLocalTree => "push local tree to Studio",
-            Self::PreviewPull => "preview pull from Studio",
-            Self::ApplyPull => "apply pull from Studio",
-            Self::ForcePull => "force pull from Studio",
-        }
-    }
 }
 
 impl BridgeSessionRecord {
@@ -428,9 +364,9 @@ impl BridgeSessionRecord {
 impl DashboardState {
     fn queue_command(
         &mut self,
-        kind: PluginCommandKind,
+        kind: BridgeCommandKind,
         requested_target_session_id: Option<&str>,
-    ) -> Result<PluginCommandEnvelope> {
+    ) -> Result<BridgeCommandEnvelope> {
         self.prune_sessions();
         if !self.plugin_connected() {
             bail!("Studio bridge is not connected; open the Nyjo plugin in Studio first");
@@ -461,7 +397,7 @@ impl DashboardState {
         let target_place_id = target_session.place_id;
 
         self.next_command_id += 1;
-        let command = PluginCommandEnvelope {
+        let command = BridgeCommandEnvelope {
             id: self.next_command_id,
             kind,
             requested_at_ms: now_ms(),
@@ -482,7 +418,7 @@ impl DashboardState {
         Ok(command)
     }
 
-    fn take_pending_command(&mut self, session_id: &str) -> Option<PluginCommandEnvelope> {
+    fn take_pending_command(&mut self, session_id: &str) -> Option<BridgeCommandEnvelope> {
         self.prune_sessions();
         if self.active_command.is_some() {
             return None;
@@ -538,7 +474,7 @@ impl DashboardState {
     fn finish_command(
         &mut self,
         result: PluginCommandResultRequest,
-    ) -> Result<PluginCommandResultRecord> {
+    ) -> Result<BridgeCommandResult> {
         self.prune_sessions();
         let active = self
             .active_command
@@ -567,7 +503,7 @@ impl DashboardState {
             .take()
             .with_context(|| "no active Studio bridge command to finish")?;
 
-        let record = PluginCommandResultRecord {
+        let record = BridgeCommandResult {
             command_id: result.command_id,
             kind: active.kind,
             target_session_id: active.target_session_id.clone(),
@@ -596,10 +532,66 @@ impl DashboardState {
     }
 
     fn snapshot(&self, root: &Path) -> DashboardSnapshot {
+        let places = self.places_snapshot();
+        let command_state = self.command_state_snapshot();
+        let selected_session = self
+            .selected_session_id
+            .as_deref()
+            .and_then(|session_id| self.sessions.get(session_id));
+
+        DashboardSnapshot {
+            server: json!({
+                "version": env!("CARGO_PKG_VERSION"),
+                "binding": "127.0.0.1",
+                "projectRoot": root.display().to_string(),
+                "dashboardPath": "/"
+            }),
+            plugin: DashboardPluginSnapshot {
+                connected: places.connected,
+                connected_sessions: places.connected_sessions,
+                selected_session_id: places.selected_session_id,
+                target_session_id: places.target_session_id,
+                selection_required: places.selection_required,
+                sessions: places.sessions,
+                bridge_version: selected_session.and_then(|session| session.bridge_version.clone()),
+                status: selected_session.and_then(|session| session.status.clone()),
+                last_seen_ms: selected_session.map(|session| session.last_seen_ms),
+                pending_command: command_state.pending_command,
+                active_command: command_state.active_command,
+            },
+            last_result: self.last_result.clone(),
+            logs: self.logs.clone(),
+        }
+    }
+
+    fn places_snapshot(&self) -> BridgePlacesSnapshot {
+        let sessions = self.session_snapshots();
+        let connected_sessions = sessions.iter().filter(|session| session.connected).count();
+        let target_session_id = self.resolved_target_session_id();
+
+        BridgePlacesSnapshot {
+            connected: self.plugin_connected(),
+            connected_sessions,
+            selected_session_id: self.selected_session_id.clone(),
+            target_session_id: target_session_id.clone(),
+            selection_required: connected_sessions > 1 && target_session_id.is_none(),
+            sessions,
+        }
+    }
+
+    fn command_state_snapshot(&self) -> BridgeCommandState {
+        BridgeCommandState {
+            pending_command: self.pending_command.clone(),
+            active_command: self.active_command.clone(),
+            last_result: self.last_result.clone(),
+        }
+    }
+
+    fn session_snapshots(&self) -> Vec<BridgeSessionSnapshot> {
         let mut sessions: Vec<_> = self
             .sessions
             .values()
-            .map(|session| DashboardBridgeSessionSnapshot {
+            .map(|session| BridgeSessionSnapshot {
                 session_id: session.session_id.clone(),
                 connected: session.connected(),
                 selected: self.selected_session_id.as_deref() == Some(session.session_id.as_str()),
@@ -618,38 +610,7 @@ impl DashboardState {
                 .then_with(|| left.place_name.cmp(&right.place_name))
                 .then_with(|| left.session_id.cmp(&right.session_id))
         });
-
-        let connected_sessions = sessions.iter().filter(|session| session.connected).count();
-        let target_session_id = self.resolved_target_session_id();
-        let selected_session = self
-            .selected_session_id
-            .as_deref()
-            .and_then(|session_id| self.sessions.get(session_id));
-
-        DashboardSnapshot {
-            server: json!({
-                "version": env!("CARGO_PKG_VERSION"),
-                "binding": "127.0.0.1",
-                "projectRoot": root.display().to_string(),
-                "dashboardPath": "/"
-            }),
-            plugin: DashboardPluginSnapshot {
-                connected: self.plugin_connected(),
-                connected_sessions,
-                selected_session_id: self.selected_session_id.clone(),
-                target_session_id,
-                selection_required: connected_sessions > 1
-                    && self.resolved_target_session_id().is_none(),
-                sessions,
-                bridge_version: selected_session.and_then(|session| session.bridge_version.clone()),
-                status: selected_session.and_then(|session| session.status.clone()),
-                last_seen_ms: selected_session.map(|session| session.last_seen_ms),
-                pending_command: self.pending_command.clone(),
-                active_command: self.active_command.clone(),
-            },
-            last_result: self.last_result.clone(),
-            logs: self.logs.clone(),
-        }
+        sessions
     }
 
     fn plugin_connected(&self) -> bool {
@@ -721,7 +682,7 @@ impl DashboardState {
         self.resolve_target_session_id(None).ok()
     }
 
-    fn describe_command_target(&self, command: &PluginCommandEnvelope) -> String {
+    fn describe_command_target(&self, command: &BridgeCommandEnvelope) -> String {
         if let Some(place_name) = &command.target_place_name {
             return match command.target_place_id {
                 Some(place_id) => format!(
@@ -738,7 +699,7 @@ impl DashboardState {
         format!("session {}", short_session_id(&command.target_session_id))
     }
 
-    fn describe_result_target(&self, result: &PluginCommandResultRecord) -> String {
+    fn describe_result_target(&self, result: &BridgeCommandResult) -> String {
         if let Some(place_name) = &result.target_place_name {
             return match result.target_place_id {
                 Some(place_id) => format!(
@@ -805,8 +766,14 @@ pub async fn serve(root: PathBuf, port: u16) -> Result<()> {
         .route("/api/update", post(update_entry))
         .route("/api/delete", post(delete_entry))
         .route("/api/sync-from-studio", post(sync_from_studio))
+        .route("/api/backups/studio/create", post(create_studio_backup))
+        .route("/api/backups/studio/read", post(read_studio_backup))
         .route("/api/health", get(health))
         .route("/api/info", get(info))
+        .route("/api/control/places", get(control_places))
+        .route("/api/control/command-state", get(control_command_state))
+        .route("/api/control/command", post(queue_control_command))
+        .route("/api/control/select-session", post(select_control_session))
         .route("/api/dashboard/state", get(dashboard_state))
         .route("/api/dashboard/command", post(queue_dashboard_command))
         .route(
@@ -853,12 +820,19 @@ async fn info(State(state): State<AppState>) -> impl IntoResponse {
         "capabilities": {
             "webDashboard": true,
             "studioBridge": true,
+            "controlApi": true,
+            "placeListingApi": true,
             "treePreview": true,
             "studioPush": true,
             "studioPullPreview": true,
             "studioPullApply": true,
             "studioPullForce": true,
+            "studioPushBackups": true,
+            "studioRestore": true,
+            "localPullBackups": true,
+            "localRestoreCli": true,
             "multiPlaceTargeting": true,
+            "pushPullCli": true,
             "embeddedFileMetadata": true,
             "compactStudioPull": true
         },
@@ -881,7 +855,7 @@ async fn info(State(state): State<AppState>) -> impl IntoResponse {
                 ".bf",
                 ".be"
             ],
-            "rootServices": SUPPORTED_ROOT_SERVICE_CLASSES,
+            "rootServices": ROOT_SERVICE_CLASSES,
             "typedValues": [
                 "boolean",
                 "number",
@@ -889,6 +863,7 @@ async fn info(State(state): State<AppState>) -> impl IntoResponse {
                 "Color3",
                 "Vector2",
                 "Vector3",
+                "CFrame",
                 "UDim",
                 "UDim2",
                 "EnumItem"
@@ -908,7 +883,8 @@ async fn info(State(state): State<AppState>) -> impl IntoResponse {
                 "UIGridLayout",
                 "UIPadding",
                 "UICorner",
-                "UIStroke"
+                "UIStroke",
+                "UIShadow"
             ]
         }
     }))
@@ -927,17 +903,54 @@ async fn dashboard_state(State(state): State<AppState>) -> impl IntoResponse {
     }
 }
 
+async fn control_places(State(state): State<AppState>) -> impl IntoResponse {
+    match state.dashboard.lock() {
+        Ok(mut dashboard) => {
+            dashboard.prune_sessions();
+            success(json!(dashboard.places_snapshot()))
+        }
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("dashboard state lock was poisoned"),
+        ),
+    }
+}
+
+async fn control_command_state(State(state): State<AppState>) -> impl IntoResponse {
+    match state.dashboard.lock() {
+        Ok(mut dashboard) => {
+            dashboard.prune_sessions();
+            success(json!(dashboard.command_state_snapshot()))
+        }
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("dashboard state lock was poisoned"),
+        ),
+    }
+}
+
 async fn queue_dashboard_command(
     State(state): State<AppState>,
-    Json(request): Json<DashboardCommandRequest>,
+    Json(request): Json<QueueBridgeCommandRequest>,
 ) -> impl IntoResponse {
+    queue_bridge_command(state, request)
+}
+
+async fn queue_control_command(
+    State(state): State<AppState>,
+    Json(request): Json<QueueBridgeCommandRequest>,
+) -> impl IntoResponse {
+    queue_bridge_command(state, request)
+}
+
+fn queue_bridge_command(state: AppState, request: QueueBridgeCommandRequest) -> impl IntoResponse {
     match state.dashboard.lock() {
         Ok(mut dashboard) => {
             match dashboard.queue_command(request.kind, request.target_session_id.as_deref()) {
-                Ok(command) => success(json!({
-                    "queued": true,
-                    "command": command,
-                    "message": format!("Queued {}", request.kind.label())
+                Ok(command) => success(json!(QueueBridgeCommandResponse {
+                    queued: true,
+                    command,
+                    message: format!("Queued {}", request.kind.label()),
                 })),
                 Err(error) => error_response(StatusCode::CONFLICT, error),
             }
@@ -951,14 +964,28 @@ async fn queue_dashboard_command(
 
 async fn select_dashboard_session(
     State(state): State<AppState>,
-    Json(request): Json<DashboardSelectSessionRequest>,
+    Json(request): Json<SelectBridgeSessionRequest>,
+) -> impl IntoResponse {
+    select_bridge_session(state, request)
+}
+
+async fn select_control_session(
+    State(state): State<AppState>,
+    Json(request): Json<SelectBridgeSessionRequest>,
+) -> impl IntoResponse {
+    select_bridge_session(state, request)
+}
+
+fn select_bridge_session(
+    state: AppState,
+    request: SelectBridgeSessionRequest,
 ) -> impl IntoResponse {
     match state.dashboard.lock() {
         Ok(mut dashboard) => match dashboard.set_selected_session(request.session_id) {
-            Ok(()) => success(json!({
-                "selected": true,
-                "selectedSessionId": dashboard.selected_session_id.clone(),
-                "message": "Studio bridge target updated"
+            Ok(()) => success(json!(SelectBridgeSessionResponse {
+                selected: true,
+                selected_session_id: dashboard.selected_session_id.clone(),
+                message: "Studio bridge target updated".to_string(),
             })),
             Err(error) => error_response(StatusCode::BAD_REQUEST, error),
         },
@@ -1069,6 +1096,26 @@ async fn sync_from_studio(
     }
 }
 
+async fn create_studio_backup(
+    State(state): State<AppState>,
+    Json(request): Json<StudioBackupCreateRequest>,
+) -> impl IntoResponse {
+    match create_studio_backup_impl(&state.root, request) {
+        Ok(backup) => success(json!({ "backup": backup })),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
+async fn read_studio_backup(
+    State(state): State<AppState>,
+    Json(request): Json<StudioBackupReadRequest>,
+) -> impl IntoResponse {
+    match read_studio_backup_impl(&state.root, request) {
+        Ok(snapshot) => success(json!(snapshot)),
+        Err(error) => error_response(StatusCode::BAD_REQUEST, error),
+    }
+}
+
 fn create_entry_impl(root: &Path, request: CreateRequest) -> Result<crate::model::InstanceNode> {
     let target = resolve_project_path(root, &request.path)?;
     let node_type = request
@@ -1087,7 +1134,7 @@ fn create_entry_impl(root: &Path, request: CreateRequest) -> Result<crate::model
             fs::create_dir_all(&target)
                 .with_context(|| format!("failed to create directory {}", target.display()))?;
             if let Some(metadata) = request.metadata {
-                write_metadata(&target, metadata)?;
+                write_directory_metadata(&target, metadata, None)?;
             }
         }
         "file" => {
@@ -1138,7 +1185,7 @@ fn update_entry_impl(root: &Path, request: UpdateRequest) -> Result<crate::model
         }
         if let Some(metadata) = request.metadata {
             validate_fixed_target_metadata(&target, Some(&metadata))?;
-            write_metadata(&target, metadata)?;
+            write_directory_metadata(&target, metadata, None)?;
         }
     } else if let Some(always_embed_header) = embedded_metadata_mode(&target) {
         validate_fixed_target_metadata(&target, request.metadata.as_ref())?;
@@ -1193,6 +1240,49 @@ fn delete_entry_impl(root: &Path, request: DeleteRequest) -> Result<crate::model
     scan_project(root)
 }
 
+fn create_studio_backup_impl(
+    root: &Path,
+    request: StudioBackupCreateRequest,
+) -> Result<BackupRecord> {
+    if request.tree.class_name != "DataModel" {
+        bail!(
+            "expected a DataModel snapshot root, got {}",
+            request.tree.class_name
+        );
+    }
+
+    let project_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve project root {}", root.display()))?;
+    let tree = serde_json::to_value(&request.tree)?;
+
+    create_studio_tree_backup(
+        &project_root,
+        StudioBackupIdentity {
+            session_id: Some(request.session_id),
+            place_name: request.place_name,
+            place_id: request.place_id,
+        },
+        request
+            .reason
+            .unwrap_or_else(|| "before Studio mutation".to_string()),
+        &tree,
+        Some(json!({
+            "source": "studioPlugin"
+        })),
+    )
+}
+
+fn read_studio_backup_impl(
+    root: &Path,
+    request: StudioBackupReadRequest,
+) -> Result<crate::backup::StudioBackupSnapshot> {
+    let project_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve project root {}", root.display()))?;
+    read_studio_tree_backup(&project_root, request.backup_id.trim())
+}
+
 fn sync_from_studio_impl(root: &Path, request: StudioSyncRequest) -> Result<StudioSyncResponse> {
     let project_root = root
         .canonicalize()
@@ -1212,9 +1302,25 @@ fn sync_from_studio_impl(root: &Path, request: StudioSyncRequest) -> Result<Stud
         request.mode == StudioSyncMode::Apply && planner.plan.stats.conflicts > 0 && !request.force;
 
     let mut applied = false;
+    let mut backup = None;
     let mut tree = None;
 
     if request.mode == StudioSyncMode::Apply && !blocked {
+        if !planner.pending_writes.is_empty() {
+            backup = Some(create_local_project_backup(
+                &project_root,
+                if request.force {
+                    "before force pull from Studio"
+                } else {
+                    "before apply pull from Studio"
+                },
+                Some(json!({
+                    "mode": request.mode,
+                    "force": request.force,
+                    "stats": &planner.plan.stats,
+                })),
+            )?);
+        }
         planner.apply()?;
         applied = true;
         tree = Some(scan_project(&project_root)?);
@@ -1226,6 +1332,7 @@ fn sync_from_studio_impl(root: &Path, request: StudioSyncRequest) -> Result<Stud
         applied,
         blocked,
         plan: planner.plan,
+        backup,
         tree,
     })
 }
@@ -1309,9 +1416,8 @@ impl<'a> StudioSyncPlanner<'a> {
                 "file",
                 format!("{} source for {}", node.class_name, node.name),
             )?;
-            self.plan_metadata_target(
+            self.plan_file_metadata_target(
                 &target,
-                false,
                 None,
                 format!("remove sidecar metadata for {}", node.name),
             )?;
@@ -1326,15 +1432,15 @@ impl<'a> StudioSyncPlanner<'a> {
             return Ok(());
         }
 
-        self.plan_metadata_target(
+        self.plan_directory_metadata_target(
             &target_dir,
-            true,
             metadata_from_studio_node(node, true, parent_class),
+            Some(&node.class_name),
             format!("metadata for {}", node.name),
         )?;
 
         for child in &node.children {
-            self.plan_studio_node(&target_dir, Some(&node.class_name), child)?;
+            self.plan_studio_node(target_dir.as_path(), Some(&node.class_name), child)?;
         }
 
         Ok(())
@@ -1353,29 +1459,39 @@ impl<'a> StudioSyncPlanner<'a> {
             return Ok(());
         }
 
-        self.plan_metadata_target(
-            target_dir,
-            true,
-            metadata_from_studio_node(node, true, parent_class),
-            format!("metadata for {}", node.name),
-        )?;
-
-        if let Some((source_file_name, contents)) = container_source_file(node) {
+        let inline_metadata = metadata_from_studio_node(node, false, parent_class);
+        if let Some((source_file_name, contents, always_embed_header)) =
+            container_source_file(node, inline_metadata.is_some())
+        {
             let rendered_source = render_embedded_text_document(
                 contents.as_str(),
-                metadata_from_studio_node(node, false, parent_class),
-                false,
+                inline_metadata,
+                always_embed_header,
             )?;
+            let source_path = target_dir.join(&source_file_name);
             self.plan_text_file_target(
-                &target_dir.join(source_file_name),
+                &source_path,
                 rendered_source,
                 "file",
                 format!("container source for {}", node.name),
             )?;
+            self.plan_directory_metadata_cleanup(
+                target_dir,
+                Some(&node.class_name),
+                Some(&source_path),
+                format!("remove legacy metadata for {}", node.name),
+            )?;
+        } else {
+            self.plan_directory_metadata_target(
+                target_dir,
+                metadata_from_studio_node(node, true, parent_class),
+                Some(&node.class_name),
+                format!("metadata for {}", node.name),
+            )?;
         }
 
         for child in &node.children {
-            self.plan_studio_node(&target_dir, Some(&node.class_name), child)?;
+            self.plan_studio_node(target_dir, Some(&node.class_name), child)?;
         }
 
         Ok(())
@@ -1470,14 +1586,13 @@ impl<'a> StudioSyncPlanner<'a> {
         Ok(())
     }
 
-    fn plan_metadata_target(
+    fn plan_file_metadata_target(
         &mut self,
         target: &Path,
-        is_directory_target: bool,
         metadata: Option<NodeMetadata>,
         detail: String,
     ) -> Result<()> {
-        let metadata_path = metadata_path_for_sync_target(target, is_directory_target)?;
+        let metadata_path = metadata_path_for_target(target)?;
         match metadata {
             Some(metadata) => self.plan_text_file_target(
                 &metadata_path,
@@ -1506,6 +1621,60 @@ impl<'a> StudioSyncPlanner<'a> {
                 )
             }
         }
+    }
+
+    fn plan_directory_metadata_target(
+        &mut self,
+        target: &Path,
+        metadata: Option<NodeMetadata>,
+        class_name_hint: Option<&str>,
+        detail: String,
+    ) -> Result<()> {
+        match metadata {
+            Some(metadata) => {
+                let metadata_path = preferred_directory_metadata_path(target, class_name_hint);
+                let rendered = render_embedded_text_document("", Some(metadata), true)?;
+                self.plan_text_file_target(&metadata_path, rendered, "metadata", detail.clone())?;
+                self.plan_directory_metadata_cleanup(
+                    target,
+                    class_name_hint,
+                    Some(&metadata_path),
+                    format!("remove legacy metadata for {detail}"),
+                )
+            }
+            None => self.plan_directory_metadata_cleanup(target, class_name_hint, None, detail),
+        }
+    }
+
+    fn plan_directory_metadata_cleanup(
+        &mut self,
+        target: &Path,
+        class_name_hint: Option<&str>,
+        keep: Option<&Path>,
+        detail: String,
+    ) -> Result<()> {
+        for path in directory_metadata_artifact_paths(target, class_name_hint) {
+            if keep.is_some_and(|keep| keep == path.as_path()) || !path.exists() {
+                continue;
+            }
+
+            if !self.force {
+                self.record_conflict(
+                    "metadata",
+                    display_path(self.project_root, &path),
+                    "local metadata would be removed by this pull; rerun with force to remove it"
+                        .to_string(),
+                );
+                continue;
+            }
+
+            self.schedule_removal(
+                &path,
+                format!("remove local metadata not present in Studio for {detail}"),
+            )?;
+        }
+
+        Ok(())
     }
 
     fn plan_logical_representation_conflicts(
@@ -1756,22 +1925,14 @@ fn studio_file_target(
     }
 
     let Some((suffix, contents, always_embed_header)) = (match node.class_name.as_str() {
-        "Script" => Some((
-            ".server.lua",
-            node.source.clone().unwrap_or_default(),
-            false,
-        )),
-        "LocalScript" => Some((
-            ".client.lua",
-            node.source.clone().unwrap_or_default(),
-            false,
-        )),
-        "ModuleScript" => Some((".lua", node.source.clone().unwrap_or_default(), false)),
-        "RemoteFunction" => Some((".rf", String::new(), false)),
-        "RemoteEvent" => Some((".re", String::new(), false)),
-        "BindableFunction" => Some((".bf", String::new(), false)),
-        "BindableEvent" => Some((".be", String::new(), false)),
-        "Folder" => Some((".folder", String::new(), false)),
+        "Script" => Some((".server.lua", node.source.clone().unwrap_or_default(), true)),
+        "LocalScript" => Some((".client.lua", node.source.clone().unwrap_or_default(), true)),
+        "ModuleScript" => Some((".lua", node.source.clone().unwrap_or_default(), true)),
+        "RemoteFunction" => Some((".rf", String::new(), true)),
+        "RemoteEvent" => Some((".re", String::new(), true)),
+        "BindableFunction" => Some((".bf", String::new(), true)),
+        "BindableEvent" => Some((".be", String::new(), true)),
+        "Folder" => Some((".folder", String::new(), true)),
         "Part" => Some((".part", render_structured_instance_contents(node)?, true)),
         "Model" => Some((".model", render_structured_instance_contents(node)?, true)),
         "WorldModel" => Some((
@@ -1779,30 +1940,31 @@ fn studio_file_target(
             render_structured_instance_contents(node)?,
             true,
         )),
-        "ScreenGui" => Some((".screengui", String::new(), false)),
-        "CanvasGroup" => Some((".canvasgroup", String::new(), false)),
-        "ScrollingFrame" => Some((".scrollingframe", String::new(), false)),
-        "SurfaceGui" => Some((".surfacegui", String::new(), false)),
-        "BillboardGui" => Some((".billboardgui", String::new(), false)),
-        "Frame" => Some((".frame", String::new(), false)),
-        "TextLabel" => Some((".textlabel", String::new(), false)),
-        "TextButton" => Some((".textbutton", String::new(), false)),
-        "TextBox" => Some((".textbox", String::new(), false)),
-        "ImageLabel" => Some((".imagelabel", String::new(), false)),
-        "ImageButton" => Some((".imagebutton", String::new(), false)),
-        "UIListLayout" => Some((".uilistlayout", String::new(), false)),
-        "UIGridLayout" => Some((".uigridlayout", String::new(), false)),
-        "UIPadding" => Some((".uipadding", String::new(), false)),
-        "UICorner" => Some((".uicorner", String::new(), false)),
-        "UIStroke" => Some((".uistroke", String::new(), false)),
-        "Texture" => Some((".texture", String::new(), false)),
-        "Decal" => Some((".decal", String::new(), false)),
-        "StringValue" => Some((".stringvalue", String::new(), false)),
-        "NumberValue" => Some((".numbervalue", String::new(), false)),
-        "IntValue" => Some((".intvalue", String::new(), false)),
-        "BoolValue" => Some((".boolvalue", String::new(), false)),
-        "Color3Value" => Some((".color3value", String::new(), false)),
-        "Vector3Value" => Some((".vector3value", String::new(), false)),
+        "ScreenGui" => Some((".screengui", String::new(), true)),
+        "CanvasGroup" => Some((".canvasgroup", String::new(), true)),
+        "ScrollingFrame" => Some((".scrollingframe", String::new(), true)),
+        "SurfaceGui" => Some((".surfacegui", String::new(), true)),
+        "BillboardGui" => Some((".billboardgui", String::new(), true)),
+        "Frame" => Some((".frame", String::new(), true)),
+        "TextLabel" => Some((".textlabel", String::new(), true)),
+        "TextButton" => Some((".textbutton", String::new(), true)),
+        "TextBox" => Some((".textbox", String::new(), true)),
+        "ImageLabel" => Some((".imagelabel", String::new(), true)),
+        "ImageButton" => Some((".imagebutton", String::new(), true)),
+        "UIListLayout" => Some((".uilistlayout", String::new(), true)),
+        "UIGridLayout" => Some((".uigridlayout", String::new(), true)),
+        "UIPadding" => Some((".uipadding", String::new(), true)),
+        "UICorner" => Some((".uicorner", String::new(), true)),
+        "UIStroke" => Some((".uistroke", String::new(), true)),
+        "UIShadow" => Some((".uishadow", String::new(), true)),
+        "Texture" => Some((".texture", String::new(), true)),
+        "Decal" => Some((".decal", String::new(), true)),
+        "StringValue" => Some((".stringvalue", String::new(), true)),
+        "NumberValue" => Some((".numbervalue", String::new(), true)),
+        "IntValue" => Some((".intvalue", String::new(), true)),
+        "BoolValue" => Some((".boolvalue", String::new(), true)),
+        "Color3Value" => Some((".color3value", String::new(), true)),
+        "Vector3Value" => Some((".vector3value", String::new(), true)),
         _ => None,
     }) else {
         return Ok(Some((
@@ -1829,7 +1991,7 @@ fn studio_container_target(parent_dir: &Path, node: &StudioNode) -> Option<PathB
         return None;
     }
 
-    if container_source_file(node).is_some() {
+    if is_script_container_class(&node.class_name) {
         return Some(parent_dir.join(&node.name));
     }
 
@@ -1844,12 +2006,33 @@ fn studio_container_target(parent_dir: &Path, node: &StudioNode) -> Option<PathB
     Some(parent_dir.join(&node.name))
 }
 
-fn container_source_file(node: &StudioNode) -> Option<(&'static str, String)> {
+fn is_script_container_class(class_name: &str) -> bool {
+    matches!(class_name, "Script" | "LocalScript" | "ModuleScript")
+}
+
+fn container_source_file(
+    node: &StudioNode,
+    metadata_present: bool,
+) -> Option<(String, String, bool)> {
     match node.class_name.as_str() {
-        "Script" => Some(("init.server.lua", node.source.clone().unwrap_or_default())),
-        "LocalScript" => Some(("init.client.lua", node.source.clone().unwrap_or_default())),
-        "ModuleScript" => Some(("init.lua", node.source.clone().unwrap_or_default())),
-        "RemoteFunction" | "RemoteEvent" | "BindableFunction" | "BindableEvent" => None,
+        "Script" => Some((
+            "init.server.lua".to_string(),
+            node.source.clone().unwrap_or_default(),
+            true,
+        )),
+        "LocalScript" => Some((
+            "init.client.lua".to_string(),
+            node.source.clone().unwrap_or_default(),
+            true,
+        )),
+        "ModuleScript" => Some((
+            "init.lua".to_string(),
+            node.source.clone().unwrap_or_default(),
+            true,
+        )),
+        "Folder" if metadata_present => Some(("init.folder".to_string(), String::new(), true)),
+        class_name if metadata_present => typed_container_suffix_for_class(class_name)
+            .map(|suffix| (format!("init{suffix}"), String::new(), true)),
         _ => None,
     }
 }
@@ -1863,7 +2046,7 @@ fn has_child_local_name_collisions(children: &[StudioNode]) -> bool {
 
 fn studio_local_entry_name(node: &StudioNode) -> String {
     if !node.children.is_empty() {
-        if container_source_file(node).is_some() || node.class_name == "Folder" {
+        if is_script_container_class(&node.class_name) || node.class_name == "Folder" {
             return node.name.clone();
         }
 
@@ -1914,6 +2097,7 @@ fn typed_container_suffix_for_class(class_name: &str) -> Option<&'static str> {
         "UIPadding" => Some(".uipadding"),
         "UICorner" => Some(".uicorner"),
         "UIStroke" => Some(".uistroke"),
+        "UIShadow" => Some(".uishadow"),
         "Texture" => Some(".texture"),
         "Decal" => Some(".decal"),
         "StringValue" => Some(".stringvalue"),
@@ -2112,8 +2296,7 @@ fn class_needs_metadata(
 }
 
 fn is_supported_root_service(node: &StudioNode) -> bool {
-    SUPPORTED_ROOT_SERVICE_CLASSES.contains(&node.class_name.as_str())
-        && node.name == node.class_name
+    ROOT_SERVICE_CLASSES.contains(&node.class_name.as_str()) && node.name == node.class_name
 }
 
 fn logical_peer_paths(parent_dir: &Path, node_name: &str) -> Vec<PathBuf> {
@@ -2144,7 +2327,11 @@ fn classify_existing_path_kind(path: &Path) -> &'static str {
 fn is_metadata_path(path: &Path) -> bool {
     path.file_name()
         .and_then(|name| name.to_str())
-        .is_some_and(|name| name == ".meta.json" || name.ends_with(".meta.json"))
+        .is_some_and(|name| {
+            name == DIRECTORY_HEADER_FILE_NAME
+                || name == ".meta.json"
+                || name.ends_with(".meta.json")
+        })
 }
 
 fn display_path(root: &Path, path: &Path) -> String {
@@ -2164,14 +2351,6 @@ fn file_name(path: &Path) -> Result<String> {
         .and_then(|name| name.to_str())
         .map(ToOwned::to_owned)
         .with_context(|| format!("path {} is missing a valid utf-8 file name", path.display()))
-}
-
-fn metadata_path_for_sync_target(target: &Path, is_directory_target: bool) -> Result<PathBuf> {
-    if is_directory_target {
-        return Ok(target.join(".meta.json"));
-    }
-
-    metadata_path_for_target(target)
 }
 
 fn now_ms() -> u64 {
@@ -2203,6 +2382,83 @@ fn write_metadata(target: &Path, metadata: NodeMetadata) -> Result<()> {
     let contents = serde_json::to_string_pretty(&metadata)?;
     fs::write(&metadata_path, contents)
         .with_context(|| format!("failed to write metadata file {}", metadata_path.display()))
+}
+
+fn legacy_directory_metadata_path(target: &Path) -> PathBuf {
+    target.join(".meta.json")
+}
+
+fn directory_descriptor_file_name_for_class(class_name: &str) -> Option<String> {
+    match class_name {
+        "Script" => Some("init.server.lua".to_string()),
+        "LocalScript" => Some("init.client.lua".to_string()),
+        "ModuleScript" => Some("init.lua".to_string()),
+        "Folder" => Some("init.folder".to_string()),
+        _ => typed_container_suffix_for_class(class_name).map(|suffix| format!("init{suffix}")),
+    }
+}
+
+fn preferred_directory_metadata_path(target: &Path, class_name_hint: Option<&str>) -> PathBuf {
+    let class_name = class_name_hint
+        .map(ToOwned::to_owned)
+        .or_else(|| fixed_target_class(target));
+
+    if let Some(class_name) = class_name
+        && let Some(file_name) = directory_descriptor_file_name_for_class(&class_name)
+    {
+        return target.join(file_name);
+    }
+
+    target.join(DIRECTORY_HEADER_FILE_NAME)
+}
+
+fn directory_metadata_artifact_paths(target: &Path, class_name_hint: Option<&str>) -> Vec<PathBuf> {
+    let mut paths = vec![
+        legacy_directory_metadata_path(target),
+        target.join(DIRECTORY_HEADER_FILE_NAME),
+        preferred_directory_metadata_path(target, class_name_hint),
+    ];
+    paths.sort();
+    paths.dedup();
+    paths
+}
+
+fn remove_directory_metadata_artifacts(
+    target: &Path,
+    class_name_hint: Option<&str>,
+    keep: Option<&Path>,
+) -> Result<()> {
+    for path in directory_metadata_artifact_paths(target, class_name_hint) {
+        if keep.is_some_and(|keep| keep == path.as_path()) || !path.exists() {
+            continue;
+        }
+
+        fs::remove_file(&path).with_context(|| {
+            format!(
+                "failed to remove migrated directory metadata file {}",
+                path.display()
+            )
+        })?;
+    }
+
+    Ok(())
+}
+
+fn write_directory_metadata(
+    target: &Path,
+    metadata: NodeMetadata,
+    class_name_hint: Option<&str>,
+) -> Result<()> {
+    let metadata = normalize_metadata(metadata);
+    let keep_path = metadata
+        .as_ref()
+        .map(|_| preferred_directory_metadata_path(target, class_name_hint));
+
+    if let Some(path) = keep_path.as_ref() {
+        write_embedded_entry_file(path, Some(String::new()), metadata, true)?;
+    }
+
+    remove_directory_metadata_artifacts(target, class_name_hint, keep_path.as_deref())
 }
 
 fn embedded_metadata_mode(target: &Path) -> Option<bool> {
@@ -2239,6 +2495,7 @@ fn embedded_metadata_mode(target: &Path) -> Option<bool> {
         || file_name.ends_with(".uipadding")
         || file_name.ends_with(".uicorner")
         || file_name.ends_with(".uistroke")
+        || file_name.ends_with(".uishadow")
         || file_name.ends_with(".texture")
         || file_name.ends_with(".decal")
         || file_name.ends_with(".stringvalue")
@@ -2248,7 +2505,7 @@ fn embedded_metadata_mode(target: &Path) -> Option<bool> {
         || file_name.ends_with(".color3value")
         || file_name.ends_with(".vector3value")
     {
-        return Some(false);
+        return Some(true);
     }
 
     None
@@ -2329,6 +2586,9 @@ fn fixed_target_class(target: &Path) -> Option<String> {
     }
     if file_name.ends_with(".uistroke") {
         return Some("UIStroke".to_string());
+    }
+    if file_name.ends_with(".uishadow") {
+        return Some("UIShadow".to_string());
     }
     if file_name.ends_with(".texture") {
         return Some("Texture".to_string());
@@ -2425,7 +2685,9 @@ fn normalize_metadata(metadata: NodeMetadata) -> Option<NodeMetadata> {
 }
 
 fn read_legacy_metadata(target: &Path) -> Result<Option<NodeMetadata>> {
-    let metadata_path = metadata_path_for_target(target)?;
+    let Ok(metadata_path) = metadata_path_for_target(target) else {
+        return Ok(None);
+    };
     if !metadata_path.exists() {
         return Ok(None);
     }
@@ -2438,7 +2700,9 @@ fn read_legacy_metadata(target: &Path) -> Result<Option<NodeMetadata>> {
 }
 
 fn remove_legacy_metadata(target: &Path) -> Result<()> {
-    let metadata_path = metadata_path_for_target(target)?;
+    let Ok(metadata_path) = metadata_path_for_target(target) else {
+        return Ok(());
+    };
     if metadata_path.exists() {
         fs::remove_file(&metadata_path).with_context(|| {
             format!(
@@ -2556,7 +2820,7 @@ mod tests {
     use tempfile::tempdir;
 
     use super::{
-        CreateRequest, DashboardState, PluginCommandKind, PluginCommandResultRequest,
+        BridgeCommandKind, CreateRequest, DashboardState, PluginCommandResultRequest,
         PluginHeartbeatRequest, StudioNode, StudioSyncMode, StudioSyncRequest, UpdateRequest,
         create_entry_impl, sync_from_studio_impl, update_entry_impl,
     };
@@ -2637,11 +2901,11 @@ mod tests {
         });
 
         let response = sync_from_studio_impl(dir.path(), request)?;
-        assert_eq!(
-            fs::read_to_string(dir.path().join("ReplicatedStorage/Shared.lua"))?,
-            "return 1"
-        );
-        assert!(dir.path().join("ReplicatedStorage/Ping.re").is_file());
+        let shared_source = fs::read_to_string(dir.path().join("ReplicatedStorage/Shared.lua"))?;
+        assert!(shared_source.contains("--!nyjo"));
+        assert!(shared_source.ends_with("return 1"));
+        let ping_source = fs::read_to_string(dir.path().join("ReplicatedStorage/Ping.re"))?;
+        assert!(ping_source.contains("--!nyjo"));
         let boot_source =
             fs::read_to_string(dir.path().join("ServerScriptService/Boot.server.lua"))?;
         assert!(boot_source.contains("--!nyjo"));
@@ -2703,10 +2967,10 @@ mod tests {
         assert!(init_source.contains("--!nyjo"));
         assert!(init_source.contains("\"Role\": \"Controller\""));
         assert!(init_source.ends_with("print('main')"));
-        assert_eq!(
-            fs::read_to_string(dir.path().join("ServerScriptService/Main/EnemyHandler.lua"))?,
-            "return { enemy = true }"
-        );
+        let child_source =
+            fs::read_to_string(dir.path().join("ServerScriptService/Main/EnemyHandler.lua"))?;
+        assert!(child_source.contains("--!nyjo"));
+        assert!(child_source.ends_with("return { enemy = true }"));
         assert!(
             !dir.path()
                 .join("ServerScriptService/Main/.meta.json")
@@ -2776,13 +3040,15 @@ mod tests {
         sync_from_studio_impl(dir.path(), request)?;
         let part_dir = dir.path().join("Workspace/Spawn.part");
         assert!(part_dir.is_dir());
-        let part_metadata = fs::read_to_string(part_dir.join(".meta.json"))?;
-        assert!(part_metadata.contains("\"Anchored\": true"));
-        assert!(part_metadata.contains("\"SpawnPoint\""));
+        let part_header = fs::read_to_string(part_dir.join("init.part"))?;
+        assert!(part_header.contains("--!nyjo"));
+        assert!(part_header.contains("\"Anchored\": true"));
+        assert!(part_header.contains("\"SpawnPoint\""));
 
         let label_source = fs::read_to_string(part_dir.join("Label.stringvalue"))?;
         assert!(label_source.contains("--!nyjo"));
         assert!(label_source.contains("\"Value\": \"Spawn\""));
+        assert!(!part_dir.join(".meta.json").exists());
         assert!(!part_dir.join("Label.meta.json").exists());
 
         Ok(())
@@ -3052,22 +3318,87 @@ mod tests {
                     children: vec![StudioNode {
                         name: "Play".to_string(),
                         class_name: "TextButton".to_string(),
-                        children: vec![StudioNode {
-                            name: "Corner".to_string(),
-                            class_name: "UICorner".to_string(),
-                            children: vec![],
-                            properties: std::collections::BTreeMap::from([(
-                                "CornerRadius".to_string(),
-                                json!({
-                                    "__nyjoType": "UDim",
-                                    "scale": 0.25,
-                                    "offset": 0
-                                }),
-                            )]),
-                            attributes: Default::default(),
-                            tags: vec![],
-                            source: None,
-                        }],
+                        children: vec![
+                            StudioNode {
+                                name: "Corner".to_string(),
+                                class_name: "UICorner".to_string(),
+                                children: vec![],
+                                properties: std::collections::BTreeMap::from([
+                                    (
+                                        "TopLeftRadius".to_string(),
+                                        json!({
+                                            "__nyjoType": "UDim",
+                                            "scale": 0,
+                                            "offset": 0
+                                        }),
+                                    ),
+                                    (
+                                        "TopRightRadius".to_string(),
+                                        json!({
+                                            "__nyjoType": "UDim",
+                                            "scale": 0,
+                                            "offset": 20
+                                        }),
+                                    ),
+                                    (
+                                        "BottomRightRadius".to_string(),
+                                        json!({
+                                            "__nyjoType": "UDim",
+                                            "scale": 0.25,
+                                            "offset": 0
+                                        }),
+                                    ),
+                                    (
+                                        "BottomLeftRadius".to_string(),
+                                        json!({
+                                            "__nyjoType": "UDim",
+                                            "scale": 0,
+                                            "offset": 6
+                                        }),
+                                    ),
+                                ]),
+                                attributes: Default::default(),
+                                tags: vec![],
+                                source: None,
+                            },
+                            StudioNode {
+                                name: "Shadow".to_string(),
+                                class_name: "UIShadow".to_string(),
+                                children: vec![],
+                                properties: std::collections::BTreeMap::from([
+                                    (
+                                        "BlurRadius".to_string(),
+                                        json!({
+                                            "__nyjoType": "UDim",
+                                            "scale": 0,
+                                            "offset": 18
+                                        }),
+                                    ),
+                                    (
+                                        "Color".to_string(),
+                                        json!({
+                                            "__nyjoType": "Color3",
+                                            "r": 0.05,
+                                            "g": 0.05,
+                                            "b": 0.08
+                                        }),
+                                    ),
+                                    ("Enabled".to_string(), json!(true)),
+                                    (
+                                        "Offset".to_string(),
+                                        json!({
+                                            "__nyjoType": "UDim2",
+                                            "x": { "scale": 0, "offset": 2 },
+                                            "y": { "scale": 0, "offset": 6 }
+                                        }),
+                                    ),
+                                    ("Transparency".to_string(), json!(0.4)),
+                                ]),
+                                attributes: Default::default(),
+                                tags: vec![],
+                                source: None,
+                            },
+                        ],
                         properties: std::collections::BTreeMap::from([(
                             "Text".to_string(),
                             json!("Play"),
@@ -3098,17 +3429,24 @@ mod tests {
         sync_from_studio_impl(dir.path(), request)?;
         let hud_dir = dir.path().join("StarterGui/Hud.screengui");
         assert!(hud_dir.is_dir());
-        let hud_metadata = fs::read_to_string(hud_dir.join(".meta.json"))?;
-        assert!(hud_metadata.contains("\"ResetOnSpawn\": false"));
+        let hud_header = fs::read_to_string(hud_dir.join("init.screengui"))?;
+        assert!(hud_header.contains("--!nyjo"));
+        assert!(hud_header.contains("\"ResetOnSpawn\": false"));
 
         let play_dir = hud_dir.join("Play.textbutton");
         assert!(play_dir.is_dir());
-        let play_metadata = fs::read_to_string(play_dir.join(".meta.json"))?;
-        assert!(play_metadata.contains("\"Text\": \"Play\""));
+        let play_header = fs::read_to_string(play_dir.join("init.textbutton"))?;
+        assert!(play_header.contains("--!nyjo"));
+        assert!(play_header.contains("\"Text\": \"Play\""));
 
         let corner_source = fs::read_to_string(play_dir.join("Corner.uicorner"))?;
         assert!(corner_source.contains("--!nyjo"));
-        assert!(corner_source.contains("\"CornerRadius\""));
+        assert!(corner_source.contains("\"TopRightRadius\""));
+
+        let shadow_source = fs::read_to_string(play_dir.join("Shadow.uishadow"))?;
+        assert!(shadow_source.contains("--!nyjo"));
+        assert!(shadow_source.contains("\"BlurRadius\""));
+        assert!(shadow_source.contains("\"Enabled\": true"));
 
         Ok(())
     }
@@ -3175,9 +3513,11 @@ mod tests {
             },
         )?;
 
-        let metadata = fs::read_to_string(dir.path().join("Workspace/Spawn.part/.meta.json"))?;
-        assert!(metadata.contains("\"Anchored\": true"));
-        assert!(metadata.contains("\"SpawnPoint\""));
+        let header = fs::read_to_string(dir.path().join("Workspace/Spawn.part/init.part"))?;
+        assert!(header.contains("--!nyjo"));
+        assert!(header.contains("\"Anchored\": true"));
+        assert!(header.contains("\"SpawnPoint\""));
+        assert!(!dir.path().join("Workspace/Spawn.part/.meta.json").exists());
 
         let workspace = tree
             .children
@@ -3190,6 +3530,49 @@ mod tests {
             .find(|child| child.name == "Spawn")
             .expect("missing Spawn");
         assert_eq!(spawn.class_name, "Part");
+
+        Ok(())
+    }
+
+    #[test]
+    fn create_entry_writes_generic_directory_header_file() -> Result<()> {
+        let dir = tempdir()?;
+        let tree = create_entry_impl(
+            dir.path(),
+            CreateRequest {
+                path: "Workspace/Quest".to_string(),
+                node_type: Some("directory".to_string()),
+                contents: None,
+                metadata: Some(NodeMetadata {
+                    class_name: None,
+                    properties: Default::default(),
+                    attributes: std::collections::BTreeMap::from([(
+                        "Stage".to_string(),
+                        json!("Lobby"),
+                    )]),
+                    tags: vec!["Tracked".to_string()],
+                }),
+                overwrite: false,
+            },
+        )?;
+
+        let header = fs::read_to_string(dir.path().join("Workspace/Quest/.nyjo"))?;
+        assert!(header.contains("--!nyjo"));
+        assert!(header.contains("\"Stage\": \"Lobby\""));
+        assert!(header.contains("\"Tracked\""));
+        assert!(!dir.path().join("Workspace/Quest/.meta.json").exists());
+
+        let workspace = tree
+            .children
+            .iter()
+            .find(|child| child.name == "Workspace")
+            .expect("missing Workspace");
+        let quest = workspace
+            .children
+            .iter()
+            .find(|child| child.name == "Quest")
+            .expect("missing Quest");
+        assert_eq!(quest.class_name, "Folder");
 
         Ok(())
     }
@@ -3231,7 +3614,7 @@ mod tests {
     }
 
     #[test]
-    fn update_entry_can_clear_embedded_metadata_and_drop_header_for_script_files() -> Result<()> {
+    fn update_entry_keeps_header_when_clearing_script_metadata() -> Result<()> {
         let dir = tempdir()?;
         fs::create_dir_all(dir.path().join("ReplicatedStorage"))?;
         fs::write(
@@ -3257,7 +3640,8 @@ return 1"#,
         )?;
 
         let source = fs::read_to_string(dir.path().join("ReplicatedStorage/Shared.lua"))?;
-        assert_eq!(source, "return 3");
+        assert!(source.contains("--!nyjo"));
+        assert!(source.ends_with("return 3"));
 
         Ok(())
     }
@@ -3400,10 +3784,69 @@ return 1"#,
     }
 
     #[test]
+    fn force_pull_creates_local_backup_that_can_be_restored() -> Result<()> {
+        let dir = tempdir()?;
+        fs::create_dir_all(dir.path().join("ReplicatedStorage"))?;
+        fs::write(
+            dir.path().join("ReplicatedStorage/Shared.lua"),
+            "return 'local'",
+        )?;
+
+        let request = StudioSyncRequest {
+            tree: StudioNode {
+                name: "Studio".to_string(),
+                class_name: "DataModel".to_string(),
+                children: vec![StudioNode {
+                    name: "ReplicatedStorage".to_string(),
+                    class_name: "ReplicatedStorage".to_string(),
+                    children: vec![StudioNode {
+                        name: "Shared".to_string(),
+                        class_name: "ModuleScript".to_string(),
+                        children: vec![],
+                        properties: Default::default(),
+                        attributes: Default::default(),
+                        tags: vec![],
+                        source: Some("return 'studio'".to_string()),
+                    }],
+                    properties: Default::default(),
+                    attributes: Default::default(),
+                    tags: vec![],
+                    source: None,
+                }],
+                properties: Default::default(),
+                attributes: Default::default(),
+                tags: vec![],
+                source: None,
+            },
+            mode: StudioSyncMode::Apply,
+            force: true,
+        };
+
+        let response = sync_from_studio_impl(dir.path(), request)?;
+        let backup = response
+            .backup
+            .clone()
+            .expect("expected apply pull backup to be created");
+
+        let synced = fs::read_to_string(dir.path().join("ReplicatedStorage/Shared.lua"))?;
+        assert!(synced.contains("--!nyjo"));
+        assert!(synced.ends_with("return 'studio'"));
+
+        let report = crate::backup::restore_local_project_backup(dir.path(), Some(&backup.id))?;
+        assert_eq!(report.restored_backup.id, backup.id);
+        assert_eq!(
+            fs::read_to_string(dir.path().join("ReplicatedStorage/Shared.lua"))?,
+            "return 'local'"
+        );
+
+        Ok(())
+    }
+
+    #[test]
     fn dashboard_rejects_commands_without_bridge_heartbeat() {
         let mut dashboard = DashboardState::default();
         let error = dashboard
-            .queue_command(PluginCommandKind::PushLocalTree, None)
+            .queue_command(BridgeCommandKind::PushLocalTree, None)
             .expect_err("expected disconnected bridge to reject commands");
         assert!(error.to_string().contains("not connected"));
     }
@@ -3427,13 +3870,52 @@ return 1"#,
         });
 
         let error = dashboard
-            .queue_command(PluginCommandKind::PreviewPull, None)
+            .queue_command(BridgeCommandKind::PreviewPull, None)
             .expect_err("expected multi-place bridge to require target selection");
         assert!(
             error
                 .to_string()
                 .contains("multiple Studio places are connected")
         );
+    }
+
+    #[test]
+    fn dashboard_places_snapshot_tracks_place_ids_and_selection() -> Result<()> {
+        let mut dashboard = DashboardState::default();
+        dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
+            session_id: "session-a".to_string(),
+            bridge_version: Some("test-bridge".to_string()),
+            place_name: Some("PlaceA".to_string()),
+            status: Some("idle".to_string()),
+            place_id: Some(101),
+        });
+        dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
+            session_id: "session-b".to_string(),
+            bridge_version: Some("test-bridge".to_string()),
+            place_name: Some("PlaceB".to_string()),
+            status: Some("idle".to_string()),
+            place_id: Some(202),
+        });
+
+        dashboard.set_selected_session(Some("session-b".to_string()))?;
+        let snapshot = dashboard.places_snapshot();
+
+        assert!(snapshot.connected);
+        assert_eq!(snapshot.connected_sessions, 2);
+        assert_eq!(snapshot.selected_session_id.as_deref(), Some("session-b"));
+        assert_eq!(snapshot.target_session_id.as_deref(), Some("session-b"));
+        assert!(!snapshot.selection_required);
+
+        let place_b = snapshot
+            .sessions
+            .iter()
+            .find(|session| session.session_id == "session-b")
+            .expect("expected selected place to be present");
+        assert_eq!(place_b.place_id, Some(202));
+        assert_eq!(place_b.place_name.as_deref(), Some("PlaceB"));
+        assert!(place_b.selected);
+
+        Ok(())
     }
 
     #[test]
@@ -3447,7 +3929,7 @@ return 1"#,
             place_id: Some(101),
         });
 
-        let queued = dashboard.queue_command(PluginCommandKind::PreviewPull, None)?;
+        let queued = dashboard.queue_command(BridgeCommandKind::PreviewPull, None)?;
         assert_eq!(queued.id, 1);
         assert!(dashboard.pending_command.is_some());
 
@@ -3498,7 +3980,7 @@ return 1"#,
         });
 
         let queued =
-            dashboard.queue_command(PluginCommandKind::PushLocalTree, Some("session-b"))?;
+            dashboard.queue_command(BridgeCommandKind::PushLocalTree, Some("session-b"))?;
         assert!(dashboard.take_pending_command("session-a").is_none());
 
         let dispatched = dashboard

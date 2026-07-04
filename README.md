@@ -11,8 +11,9 @@ It scans a Linux-friendly project folder, turns it into a Roblox-style instance 
 - Parses a local project into one canonical in-memory instance tree
 - Maps Roblox-aware file extensions like `.server.lua`, `.client.lua`, `.lua`, `.re`, `.rf`, `.bf`, `.be`, and common typed UI/value/visual shapes
 - Supports compact subtree files like `.instance.json`, `.model.json`, and `.service.json`
-- Supports embedded metadata headers inside file-backed nodes, so many cases no longer need sidecar `.meta.json` files
+- Prefers Nyjo headers for fixed-shape local files and `init.*` directory self files, so normal typed nodes no longer need sidecar `.meta.json` files
 - Supports typed container directories for child-bearing non-script instances like parts, UI trees, value objects, and textures
+- Round-trips newer UI modifier data like `UIShadow` plus per-corner `UICorner` radii when Studio exposes those properties
 - Runs a local server and browser dashboard for status, logs, preview, and sync control
 - Installs a Roblox Studio plugin bridge for Linux/Vinegar-based Studio setups
 - Supports Studio push plus Studio pull with preview/apply/force modes
@@ -137,11 +138,18 @@ Then open Roblox Studio on Linux, load the Nyjo plugin, and use the browser dash
   Starts the local sync server and browser dashboard.
 - `nyjo doctor --root <path>`
   Prints a quick project summary and class counts.
+- `nyjo places [--port <port>] [--json]`
+  Lists connected Studio bridge sessions with place names, place ids, and session ids.
+- `nyjo push [--port <port>] [--place-id <id> | --session-id <id>] [--wait-ms <ms>] [--json]`
+  Queues a Studio push through the running local server and optionally waits for the result.
+- `nyjo pull [--port <port>] [--mode <preview|apply|force>] [--place-id <id> | --session-id <id>] [--wait-ms <ms>] [--json]`
+  Queues a Studio pull through the running local server and optionally waits for the result.
 
 Current workflow note:
 
-- Standalone `nyjo push`, `nyjo pull`, `nyjo watch`, and `nyjo diff` subcommands do not exist yet.
-- Sync currently flows through `nyjo serve`, the browser dashboard, and the Studio plugin bridge.
+- `nyjo push` and `nyjo pull` now talk to the running local server, which still requires `nyjo serve` plus an active Studio bridge session.
+- `nyjo watch` and `nyjo diff` do not exist yet.
+- Sync still flows through `nyjo serve`, the browser dashboard, and the Studio plugin bridge.
 
 ## Local Project Format
 
@@ -165,6 +173,7 @@ Representative local shapes:
 - `Play.textbutton` -> `TextButton`
 - `Root.frame` -> `Frame`
 - `Corner.uicorner` -> `UICorner`
+- `Shadow.uishadow` -> `UIShadow`
 - `Surface.texture` -> `Texture`
 - `Sticker.decal` -> `Decal`
 - `Label.stringvalue` -> `StringValue`
@@ -188,17 +197,18 @@ Many file-backed nodes can keep their metadata inside the file itself:
 print("hello from nyjo")
 ```
 
-This header style is supported for:
+Nyjo now writes this header style for its fixed-shape text-backed local files, including:
 
-- `.server.lua`, `.client.lua`, `.lua`
-- `.part`, `.model`, `.worldmodel`
-- `.folder`, `.rf`, `.re`, `.bf`, `.be`
+- scripts: `.server.lua`, `.client.lua`, `.lua`
+- structured/model files: `.part`, `.model`, `.worldmodel`
+- marker/value/object files like `.folder`, `.rf`, `.re`, `.bf`, `.be`
+- typed UI, value, visual, and modifier files like `.textbutton`, `.uicorner`, `.uishadow`, `.texture`, `.stringvalue`
 
 The file suffix still stays authoritative. For example, `.server.lua` must remain a `Script`, `.re` must remain a `RemoteEvent`, and `.folder` must remain a `Folder`.
 
-Many other fixed-shape typed files currently keep their metadata in `.meta.json` or via a typed container directory.
+Compact `.instance.json`, `.model.json`, and `.service.json` files stay JSON-native.
 
-Legacy `.meta.json` files still parse for compatibility, especially for directory-backed containers.
+Legacy `.meta.json` files still parse for compatibility, and generic unsuffixed directories can use `.nyjo` when there is no dedicated `init.*` self file shape.
 
 If you need an arbitrary non-script class that does not have its own dedicated suffix, prefer `.instance.json` or a directory-backed node with legacy `.meta.json`.
 
@@ -209,18 +219,23 @@ Child-bearing instances can now live as real nested directories instead of being
 ```text
 Workspace/
   Spawn.part/
-    .meta.json
+    init.part
     Surface.texture
 
 StarterGui/
   Hud.screengui/
-    .meta.json
+    init.screengui
     Play.textbutton/
-      .meta.json
+      init.textbutton
       Corner.uicorner
+      Shadow.uishadow
 ```
 
 This works well for parts, UI trees, value objects, textures/decals, and similar instance graphs where each child should keep its own properties and metadata.
+
+For directory-backed typed nodes, Nyjo now prefers a matching `init.*` self file with a Nyjo header. Generic unsuffixed directories can use `.nyjo`, and legacy `.meta.json` files still parse as fallback input.
+
+Current Roblox Creator Hub docs still list UI shadows and individual `UICorner` radii under **File > Beta Features > New UI Capabilities** in Studio. Nyjo will sync them whenever the running Studio build exposes those classes and properties.
 
 If a Studio subtree has repeated child names that would map to the same local file path, Nyjo writes that subtree as compact `.instance.json` instead so every child can be preserved.
 
@@ -256,6 +271,13 @@ The dashboard is meant to be the main control surface. It shows:
 
 If you have multiple Studio places open at the same time, Nyjo now requires you to select the exact target place in the dashboard before it will queue a Studio write or pull command.
 
+You can also drive the same bridge from the CLI now:
+
+- `nyjo places --json` to build a place-id to session-id map
+- `nyjo push --place-id 123456`
+- `nyjo pull --mode preview --place-id 123456`
+- `nyjo pull --mode apply --session-id <session>`
+
 ## Studio Plugin Bridge
 
 The Roblox Studio plugin is a local bridge, not the main source of truth. Its job is to:
@@ -274,7 +296,7 @@ The local files and local parser remain the core model.
 - This is still an early tool and does not claim full Roblox property coverage
 - Round-tripping is strongest for the currently supported file types and translated properties
 - Conflict handling exists, but full two-sided reconciliation is still a work in progress
-- Dedicated `nyjo push`, `nyjo pull`, `nyjo watch`, and `nyjo diff` CLI commands are not implemented yet
+- `nyjo watch` and `nyjo diff` CLI commands are not implemented yet
 - Auto-install of the plugin currently targets Vinegar-style Linux Studio paths
 
 For a more detailed project status and roadmap, see [TASK.md](TASK.md).

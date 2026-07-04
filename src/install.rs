@@ -2,7 +2,7 @@ use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 const PLUGIN_FILE_NAME: &str = "Nyjo.lua";
 const PLUGIN_TEMPLATE: &str = include_str!("../assets/Nyjo.lua");
@@ -11,10 +11,26 @@ const PLUGIN_TEMPLATE: &str = include_str!("../assets/Nyjo.lua");
 pub struct InstallReport {
     pub packaged_plugin_path: PathBuf,
     pub installed_paths: Vec<PathBuf>,
-    pub searched_roots: Vec<PathBuf>,
+    pub discovered_roots: Vec<PathBuf>,
+    pub searched_users_dir: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct VinegarRootDiscovery {
+    searched_users_dir: Option<PathBuf>,
+    discovered_roots: Vec<PathBuf>,
 }
 
 pub fn install_plugin(output_dir: &Path, port: u16) -> Result<InstallReport> {
+    let discovery = discover_default_vinegar_roots()?;
+    install_plugin_with_discovery(output_dir, port, discovery)
+}
+
+fn install_plugin_with_discovery(
+    output_dir: &Path,
+    port: u16,
+    discovery: VinegarRootDiscovery,
+) -> Result<InstallReport> {
     let output_dir = normalize_output_dir(output_dir)?;
     fs::create_dir_all(&output_dir)
         .with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
@@ -28,16 +44,8 @@ pub fn install_plugin(output_dir: &Path, port: u16) -> Result<InstallReport> {
         )
     })?;
 
-    let discovered_roots = discover_default_vinegar_roots()?;
-    if discovered_roots.is_empty() {
-        bail!(
-            "could not find a Vinegar Studio AppData root under ~/.var/app/org.vinegarhq.Vinegar; the plugin was still packaged at {}",
-            packaged_plugin_path.display()
-        );
-    }
-
-    let mut installed_paths = Vec::new();
-    for root in &discovered_roots {
+    let mut installed_paths = Vec::with_capacity(discovery.discovered_roots.len());
+    for root in &discovery.discovered_roots {
         let plugins_dir = root.join("Plugins");
         fs::create_dir_all(&plugins_dir).with_context(|| {
             format!(
@@ -58,7 +66,8 @@ pub fn install_plugin(output_dir: &Path, port: u16) -> Result<InstallReport> {
     Ok(InstallReport {
         packaged_plugin_path,
         installed_paths,
-        searched_roots: discovered_roots,
+        discovered_roots: discovery.discovered_roots,
+        searched_users_dir: discovery.searched_users_dir,
     })
 }
 
@@ -76,11 +85,26 @@ fn render_plugin_source(port: u16) -> String {
     PLUGIN_TEMPLATE.replace("{{DEFAULT_PORT}}", &port.to_string())
 }
 
-fn discover_default_vinegar_roots() -> Result<Vec<PathBuf>> {
-    let home = env::var("HOME").context("HOME is not set")?;
-    let users_root = PathBuf::from(home)
-        .join(".var/app/org.vinegarhq.Vinegar/data/vinegar/prefixes/studio/drive_c/users");
-    discover_vinegar_roots_from_users_dir(&users_root)
+fn discover_default_vinegar_roots() -> Result<VinegarRootDiscovery> {
+    discover_vinegar_roots_from_home(env::var_os("HOME").map(PathBuf::from))
+}
+
+fn discover_vinegar_roots_from_home(home: Option<PathBuf>) -> Result<VinegarRootDiscovery> {
+    let Some(home) = home else {
+        return Ok(VinegarRootDiscovery {
+            searched_users_dir: None,
+            discovered_roots: Vec::new(),
+        });
+    };
+
+    let users_root =
+        home.join(".var/app/org.vinegarhq.Vinegar/data/vinegar/prefixes/studio/drive_c/users");
+    let discovered_roots = discover_vinegar_roots_from_users_dir(&users_root)?;
+
+    Ok(VinegarRootDiscovery {
+        searched_users_dir: Some(users_root),
+        discovered_roots,
+    })
 }
 
 fn discover_vinegar_roots_from_users_dir(users_root: &Path) -> Result<Vec<PathBuf>> {
@@ -114,7 +138,10 @@ mod tests {
     use anyhow::Result;
     use tempfile::tempdir;
 
-    use super::{PLUGIN_FILE_NAME, discover_vinegar_roots_from_users_dir, render_plugin_source};
+    use super::{
+        PLUGIN_FILE_NAME, VinegarRootDiscovery, discover_vinegar_roots_from_home,
+        discover_vinegar_roots_from_users_dir, install_plugin_with_discovery, render_plugin_source,
+    };
 
     #[test]
     fn renders_plugin_with_requested_port() {
@@ -139,6 +166,43 @@ mod tests {
                 .iter()
                 .all(|path| path.ends_with("AppData/Local/Roblox"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn packages_plugin_even_without_vinegar_roots() -> Result<()> {
+        let dir = tempdir()?;
+        let output_dir = dir.path().join("dist");
+        let searched_users_dir = dir.path().join("users");
+
+        let report = install_plugin_with_discovery(
+            &output_dir,
+            34872,
+            VinegarRootDiscovery {
+                searched_users_dir: Some(searched_users_dir.clone()),
+                discovered_roots: Vec::new(),
+            },
+        )?;
+
+        assert_eq!(
+            report.packaged_plugin_path,
+            output_dir.join(PLUGIN_FILE_NAME)
+        );
+        assert!(report.packaged_plugin_path.is_file());
+        assert!(report.installed_paths.is_empty());
+        assert!(report.discovered_roots.is_empty());
+        assert_eq!(report.searched_users_dir, Some(searched_users_dir));
+
+        Ok(())
+    }
+
+    #[test]
+    fn missing_home_skips_auto_install_discovery() -> Result<()> {
+        let discovery = discover_vinegar_roots_from_home(None)?;
+
+        assert!(discovery.discovered_roots.is_empty());
+        assert_eq!(discovery.searched_users_dir, None);
+
         Ok(())
     }
 

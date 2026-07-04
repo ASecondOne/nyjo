@@ -51,7 +51,7 @@ Implemented right now:
 - [x] Directory-backed script containers for scripts that also own children
 - [x] Compact subtree parsing for `.instance.json`, `.model.json`, and `.service.json`
 - [x] `.nyjoignore` support
-- [x] Embedded header metadata for file-backed scripts, marker files, folders, and structured instance files
+- [x] Embedded header metadata for fixed-shape file-backed nodes plus typed directory self files
 - [x] Legacy `.meta.json` overrides for class name, properties, attributes, and tags
 - [x] Local-only HTTP API with basic tree/create/update/delete endpoints
 - [x] `GET /api/health` plus `GET /api/info` for version/capability reporting
@@ -67,6 +67,14 @@ Implemented right now:
 - [x] Typed fixed-shape files and typed container directories for common UI, value, and visual instances
 - [x] Typed property translation for common UI/layout/value/basepart cases
 - [x] Extra property translation for buttons plus `Decal` and `Texture`
+- [x] First-pass `UIShadow` typed file/directory support plus Studio property translation
+- [x] `UICorner` individual corner radii round-tripping for the new UI capabilities surface
+- [x] Header-backed `init.*` metadata files for typed container directories plus `.nyjo` generic directory headers
+- [x] Automatic local project backups before apply/force pull plus `nyjo restore`
+- [x] Automatic Studio tree backups before push plus a Studio-side restore button
+- [x] Managed-child tracking so Nyjo only deletes children it actually synced earlier
+- [x] Round-trip coverage for `CFrame`, `MeshPart`, `SpecialMesh`, and `SurfaceAppearance` map-critical properties
+- [x] Safer refusal path for classes like `UnionOperation` and `Terrain` that Nyjo cannot recreate faithfully yet
 - [x] Zsh install/helper scripts for real `nyjo` CLI usage
 
 Still missing:
@@ -75,7 +83,20 @@ Still missing:
 - [ ] Incremental diff engine
 - [ ] Smarter Studio snapshot filtering and reconciliation
 - [ ] Full two-sided conflict detection and resolution
+- [ ] Lossless support for binary/CSG-heavy classes that cannot be reconstructed from text snapshots alone
 - [ ] Robust config and richer project bootstrap
+
+## Safety and Restore
+
+The current safety posture should now be:
+
+- Every Studio push creates a server-side Studio backup first.
+- The Studio widget can restore the most recent remembered Studio backup for the current place.
+- Every apply/force pull creates a hidden local backup under `.nyjo-backups/local/`.
+- `nyjo restore --root <project> [--backup-id <id>]` restores the newest local backup by default.
+- Nyjo now refuses to create known lossy classes like `UnionOperation` and `Terrain` from plain local data instead of silently rebuilding broken defaults.
+
+That still does not mean every Roblox class is magically lossless. For classes whose real data lives in binary engine state or CSG internals, the correct behavior is to preserve backups and fail loudly until Nyjo has a true representation for them.
 
 ## Local Project Format
 
@@ -84,6 +105,7 @@ Primary conventions:
 - CLI name: `nyjo`
 - Ignore file: `.nyjoignore`
 - Preferred metadata storage: embedded in the file itself when the file type supports it
+- Generic directory header file: `.nyjo`
 - Legacy metadata file: `.meta.json`
 - Local bind address: `127.0.0.1`
 - Browser dashboard: `http://127.0.0.1:<port>/`
@@ -105,6 +127,7 @@ Current extension mapping:
 - `.screengui`, `.canvasgroup`, `.scrollingframe`, `.surfacegui`, `.billboardgui`
 - `.frame`, `.textbutton`, `.textlabel`, `.textbox`, `.imagelabel`, `.imagebutton`
 - `.uilistlayout`, `.uigridlayout`, `.uipadding`, `.uicorner`, `.uistroke`
+- `.uishadow`
 - `.texture`, `.decal`
 - `.stringvalue`, `.numbervalue`, `.intvalue`, `.boolvalue`, `.color3value`, `.vector3value`
 - `.folder` -> `Folder`
@@ -120,13 +143,15 @@ Embedded header convention:
   - `--CONTENTS`
   - the real body after that marker
 - Supported file-backed header targets:
-  - `.server.lua`, `.client.lua`, `.lua`
-  - `.part`, `.model`, `.worldmodel`
-  - `.folder`, `.rf`, `.re`, `.bf`, `.be`
+  - scripts: `.server.lua`, `.client.lua`, `.lua`
+  - structured/model files: `.part`, `.model`, `.worldmodel`
+  - fixed-shape marker/value/object files: `.folder`, `.rf`, `.re`, `.bf`, `.be`
+  - fixed-shape UI, value, visual, and modifier files like `.textbutton`, `.uicorner`, `.uishadow`, `.texture`, `.stringvalue`
 - Fixed suffixes stay authoritative; headers and sidecar metadata can add properties, attributes, and tags but should not change a `.server.lua` into a different class.
-- The parser still accepts legacy sidecar `.meta.json` files for backward compatibility and as a fallback for directory-backed containers.
+- Compact `.instance.json`, `.model.json`, and `.service.json` files stay JSON-native.
+- The parser still accepts legacy sidecar `.meta.json` files for backward compatibility, and generic unsuffixed directories can use `.nyjo` when there is no dedicated `init.*` self file shape.
 
-Directory-backed script convention:
+Directory-backed init convention:
 
 - `SomeScript.server.lua` still works for a flat `Script`
 - `SomeLocal.client.lua` still works for a flat `LocalScript`
@@ -139,14 +164,17 @@ Directory-backed script convention:
   - `init.server.lua`
   - `init.client.lua`
   - `init.lua`
+- Typed directory-backed nodes now prefer matching self files like `init.part`, `init.screengui`, `init.textbutton`, or `init.folder`.
+- Generic unsuffixed directories without a dedicated self-file shape can use `.nyjo`.
 
 Typed container directories:
 
 - Any supported fixed-shape non-script node can also be represented as a directory when it needs children.
 - Examples:
-  - `Spawn.part/.meta.json` plus nested children like `Surface.texture`
+  - `Spawn.part/init.part` plus nested children like `Surface.texture`
   - `Hud.screengui/Play.textbutton/Corner.uicorner`
-- Directory metadata still uses `.meta.json`, while the directory name keeps the authoritative class suffix.
+  - `Hud.screengui/Play.textbutton/Shadow.uishadow`
+- Preferred typed-directory metadata now lives in matching `init.*` header files, while generic unsuffixed directories can fall back to `.nyjo`.
 - Studio subtrees with repeated child names fall back to compact `.instance.json` so duplicate children are not collapsed into one local path.
 
 Compact subtree convention:
@@ -191,8 +219,8 @@ Structural items currently translated:
 - Local script files: `Script`, `LocalScript`, `ModuleScript`
 - Local marker files with embedded headers: `RemoteEvent`, `RemoteFunction`, `BindableEvent`, `BindableFunction`
 - Structured instance files with embedded headers: `Part`, `Model`, `WorldModel`, `Folder`
-- Typed fixed-shape files and directories for common UI, value, and visual instances
-- Directory-backed script containers with `init.server.lua`, `init.client.lua`, or `init.lua`
+- Typed fixed-shape files and directories for common UI, value, visual, and modifier instances including `UIShadow`
+- Directory-backed init files including `init.server.lua`, `init.client.lua`, `init.lua`, and typed self files like `init.part` or `init.textbutton`
 - Compact subtree files: `.instance.json`, `.model.json`, `.service.json`
 - Generic compact fallback files via `.instance.json` for unsupported or intentionally compact instance subtrees
 - Legacy directory-backed instances via `.meta.json` class overrides still parse for backward compatibility
@@ -200,12 +228,12 @@ Structural items currently translated:
 Property/value shapes currently translated:
 
 - JSON primitives: `boolean`, `number`, `string`
-- Tagged typed values: `Color3`, `Vector2`, `Vector3`, `UDim`, `UDim2`, `EnumItem`
+- Tagged typed values: `Color3`, `Vector2`, `Vector3`, `CFrame`, `UDim`, `UDim2`, `EnumItem`
 - Attributes and tags when they fit the same supported value model
 
 Common Studio property groups currently snapshotted and pushed back:
 
-- `BasePart`
+- `BasePart` including transform-oriented fields like `CFrame`
 - `ValueBase`
 - `ScreenGui`
 - `GuiObject`
@@ -216,9 +244,18 @@ Common Studio property groups currently snapshotted and pushed back:
 - `UIListLayout`
 - `UIGridLayout`
 - `UIPadding`
-- `UICorner`
+- `UICorner`, including individual corner radii when Studio exposes them
 - `UIStroke`
+- `UIShadow`
 - `Decal`, `Texture`
+
+Current Roblox Creator Hub docs still list UI shadows and individual `UICorner` radii behind Studio's **File > Beta Features > New UI Capabilities** toggle. Nyjo now preserves those values whenever the active Studio build exposes them.
+
+## Good Next Adds
+
+- [ ] Add first-class `UIGradient` local file/directory support and property round-tripping
+- [ ] Expand `CanvasGroup`-specific and advanced `UIStroke` property coverage
+- [ ] Surface clearer plugin warnings when a beta-gated Roblox class or property is unavailable in the current Studio build
 
 Current limitation:
 
