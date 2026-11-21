@@ -42,6 +42,10 @@ pub struct BridgeCommandEnvelope {
     pub target_place_name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub target_place_id: Option<u64>,
+    /// Push only: let the plugin remove Studio instances that Nyjo created
+    /// earlier and that no longer exist locally. Off by default.
+    #[serde(default)]
+    pub allow_deletes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -126,6 +130,8 @@ pub struct QueueBridgeCommandRequest {
     pub kind: BridgeCommandKind,
     #[serde(default)]
     pub target_session_id: Option<String>,
+    #[serde(default)]
+    pub allow_deletes: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -225,11 +231,22 @@ impl NyjoControlClient {
         kind: BridgeCommandKind,
         target_session_id: Option<String>,
     ) -> Result<QueueBridgeCommandResponse> {
+        self.queue_command_with_options(kind, target_session_id, false)
+            .await
+    }
+
+    pub async fn queue_command_with_options(
+        &self,
+        kind: BridgeCommandKind,
+        target_session_id: Option<String>,
+        allow_deletes: bool,
+    ) -> Result<QueueBridgeCommandResponse> {
         self.post(
             "/api/control/command",
             &QueueBridgeCommandRequest {
                 kind,
                 target_session_id,
+                allow_deletes,
             },
         )
         .await

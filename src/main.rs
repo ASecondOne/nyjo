@@ -61,9 +61,16 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Push the local project into the connected Studio place.
+    ///
+    /// By default nothing is ever removed from Studio. Pass --allow-deletes to
+    /// let the plugin move instances Nyjo created earlier, and that no longer
+    /// exist locally, into ServerStorage.NyjoTrash.
     Push {
         #[arg(long, default_value_t = 34872)]
         port: u16,
+        #[arg(long)]
+        allow_deletes: bool,
         #[arg(long)]
         session_id: Option<String>,
         #[arg(long)]
@@ -142,6 +149,7 @@ async fn main() -> Result<()> {
         Some(Commands::Places { port, json }) => run_places(port, json).await?,
         Some(Commands::Push {
             port,
+            allow_deletes,
             session_id,
             place_id,
             wait_ms,
@@ -150,6 +158,7 @@ async fn main() -> Result<()> {
             run_bridge_command(
                 port,
                 BridgeCommandKind::PushLocalTree,
+                allow_deletes,
                 BridgeTargetSelector {
                     session_id,
                     place_id,
@@ -170,6 +179,7 @@ async fn main() -> Result<()> {
             run_bridge_command(
                 port,
                 mode.command_kind(),
+                false,
                 BridgeTargetSelector {
                     session_id,
                     place_id,
@@ -357,6 +367,7 @@ async fn run_places(port: u16, json: bool) -> Result<()> {
 async fn run_bridge_command(
     port: u16,
     kind: BridgeCommandKind,
+    allow_deletes: bool,
     selector: BridgeTargetSelector,
     wait_ms: u64,
     json: bool,
@@ -365,9 +376,11 @@ async fn run_bridge_command(
     let places = client.list_places().await?;
     let target_session_id = resolve_target_session_id(&places, &selector)?;
 
-    if wait_ms == 0 {
-        let queued = client.queue_command(kind, target_session_id).await?;
+    let queued = client
+        .queue_command_with_options(kind, target_session_id, allow_deletes)
+        .await?;
 
+    if wait_ms == 0 {
         if json {
             println!("{}", serde_json::to_string_pretty(&queued)?);
         } else {
@@ -382,14 +395,25 @@ async fn run_bridge_command(
         return Ok(());
     }
 
-    let report = client
-        .run_command(kind, target_session_id, Duration::from_millis(wait_ms))
+    let started = std::time::Instant::now();
+    let result = client
+        .wait_for_command_result(queued.command.id, Duration::from_millis(wait_ms))
         .await?;
+    let report = BridgeCommandRunReport {
+        command: queued.command,
+        result,
+        waited_ms: started.elapsed().as_millis() as u64,
+    };
 
     if json {
         println!("{}", serde_json::to_string_pretty(&report)?);
     } else {
         print_command_report(&report);
+    }
+
+    if !report.result.ok {
+        // Non-zero exit so scripts / AI agents notice a failed sync.
+        anyhow::bail!("Studio reported failure: {}", report.result.summary);
     }
 
     Ok(())

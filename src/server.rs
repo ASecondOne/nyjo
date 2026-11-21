@@ -2,14 +2,16 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Component, Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
-use axum::extract::{DefaultBodyLimit, State};
-use axum::http::StatusCode;
+use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::{HeaderMap, StatusCode, header};
+use axum::middleware::{self, Next};
 use axum::response::Html;
 use axum::response::IntoResponse;
+use axum::response::Response;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Deserializer, Serialize};
@@ -25,6 +27,7 @@ use crate::control::{
     BridgePlacesSnapshot, BridgeSessionSnapshot, QueueBridgeCommandRequest,
     QueueBridgeCommandResponse, SelectBridgeSessionRequest, SelectBridgeSessionResponse,
 };
+use crate::fsutil::write_atomic;
 use crate::model::{InstanceNode, NodeMetadata};
 use crate::parser::{
     ROOT_SERVICE_CLASSES, metadata_path_for_target, read_embedded_text_payload, scan_project,
@@ -34,6 +37,29 @@ use crate::parser::{
 struct AppState {
     root: PathBuf,
     dashboard: Arc<Mutex<DashboardState>>,
+    /// Serialises everything that reads or writes the project on disk so two
+    /// requests (e.g. a pull and an API edit) can never interleave writes.
+    fs_lock: Arc<tokio::sync::Mutex<()>>,
+}
+
+/// Studio plugin protocol this server speaks. Bumped to 2 for the guarded
+/// push (no silent deletes, recorded undo, soft-delete into NyjoTrash).
+pub const BRIDGE_PROTOCOL_VERSION: &str = "nyjo-studio-bridge/2";
+/// A queued command that no plugin picked up within this window is dropped
+/// rather than surprising the user by running minutes later.
+const PENDING_COMMAND_TTL_MS: u64 = 60_000;
+/// A running command whose Studio session went silent this long is treated
+/// as abandoned (Studio closed / plugin reloaded) so the bridge unblocks.
+const ACTIVE_COMMAND_STALE_MS: u64 = 120_000;
+/// Maximum Roblox instance name length Nyjo will map onto a file name.
+const MAX_LOCAL_NAME_BYTES: usize = 200;
+/// Top-level project entries the HTTP API may never touch.
+const RESERVED_PROJECT_ENTRIES: &[&str] = &[".git", ".nyjo-backups"];
+
+fn lock_dashboard(dashboard: &Mutex<DashboardState>) -> Result<MutexGuard<'_, DashboardState>, ()> {
+    // A panic in one handler must not brick the bridge for the rest of the
+    // session, so recover the guard from a poisoned lock.
+    Ok(dashboard.lock().unwrap_or_else(PoisonError::into_inner))
 }
 
 const LOGICAL_NODE_FILE_SUFFIXES: &[&str] = &[
@@ -362,11 +388,24 @@ impl BridgeSessionRecord {
 }
 
 impl DashboardState {
+    #[cfg(test)]
     fn queue_command(
         &mut self,
         kind: BridgeCommandKind,
         requested_target_session_id: Option<&str>,
     ) -> Result<BridgeCommandEnvelope> {
+        self.queue_command_with_options(kind, requested_target_session_id, false)
+    }
+
+    fn queue_command_with_options(
+        &mut self,
+        kind: BridgeCommandKind,
+        requested_target_session_id: Option<&str>,
+        allow_deletes: bool,
+    ) -> Result<BridgeCommandEnvelope> {
+        if allow_deletes && kind != BridgeCommandKind::PushLocalTree {
+            bail!("allowDeletes only applies to pushLocalTree");
+        }
         self.prune_sessions();
         if !self.plugin_connected() {
             bail!("Studio bridge is not connected; open the Nyjo plugin in Studio first");
@@ -392,6 +431,17 @@ impl DashboardState {
         let target_session = self.sessions.get(&target_session_id).with_context(|| {
             format!("target Studio bridge session {target_session_id} was not found")
         })?;
+        if target_session.bridge_version.as_deref() != Some(BRIDGE_PROTOCOL_VERSION) {
+            bail!(
+                "the Nyjo plugin in {} speaks {} but this server needs {}; run `nyjo install` and restart Studio",
+                target_session.label(),
+                target_session
+                    .bridge_version
+                    .as_deref()
+                    .unwrap_or("an unknown protocol"),
+                BRIDGE_PROTOCOL_VERSION
+            );
+        }
         let target_session_label = target_session.label();
         let target_place_name = target_session.place_name.clone();
         let target_place_id = target_session.place_id;
@@ -404,13 +454,19 @@ impl DashboardState {
             target_session_id,
             target_place_name,
             target_place_id,
+            allow_deletes,
         };
         self.log(
-            "info",
+            if allow_deletes { "warn" } else { "info" },
             format!(
-                "Queued command #{}: {} -> {}",
+                "Queued command #{}: {}{} -> {}",
                 command.id,
                 kind.label(),
+                if allow_deletes {
+                    " (deletes allowed)"
+                } else {
+                    ""
+                },
                 target_session_label
             ),
         );
@@ -716,7 +772,64 @@ impl DashboardState {
         format!("session {}", short_session_id(&result.target_session_id))
     }
 
+    fn expire_stale_commands(&mut self) {
+        let now = now_ms();
+        if let Some(pending) = self.pending_command.clone() {
+            let target_connected = self
+                .sessions
+                .get(&pending.target_session_id)
+                .is_some_and(BridgeSessionRecord::connected);
+            let expired = now.saturating_sub(pending.requested_at_ms) > PENDING_COMMAND_TTL_MS;
+            if expired || !target_connected {
+                self.pending_command = None;
+                self.record_abandoned(
+                    &pending,
+                    if expired {
+                        "was not picked up by Studio in time and was dropped"
+                    } else {
+                        "was dropped because its Studio session went offline"
+                    },
+                );
+            }
+        }
+        if let Some(active) = self.active_command.clone() {
+            let last_seen = self
+                .sessions
+                .get(&active.target_session_id)
+                .map_or(0, |session| session.last_seen_ms);
+            if now.saturating_sub(last_seen) > ACTIVE_COMMAND_STALE_MS {
+                self.active_command = None;
+                self.record_abandoned(
+                    &active,
+                    "was abandoned because its Studio session stopped responding (Studio closed or plugin reloaded?)",
+                );
+            }
+        }
+    }
+
+    fn record_abandoned(&mut self, command: &BridgeCommandEnvelope, reason: &str) {
+        let summary = format!(
+            "Command #{} ({}) {reason}",
+            command.id,
+            command.kind.label()
+        );
+        self.log("warn", summary.clone());
+        self.last_result = Some(BridgeCommandResult {
+            command_id: command.id,
+            kind: command.kind,
+            target_session_id: command.target_session_id.clone(),
+            target_place_name: command.target_place_name.clone(),
+            target_place_id: command.target_place_id,
+            ok: false,
+            summary,
+            detail: None,
+            data: None,
+            finished_at_ms: now_ms(),
+        });
+    }
+
     fn prune_sessions(&mut self) {
+        self.expire_stale_commands();
         let cutoff = now_ms().saturating_sub(PLUGIN_SESSION_RETENTION_MS);
         self.sessions.retain(|session_id, session| {
             session.last_seen_ms >= cutoff
@@ -784,9 +897,11 @@ pub async fn serve(root: PathBuf, port: u16) -> Result<()> {
         .route("/api/plugin/poll", post(plugin_poll))
         .route("/api/plugin/command-result", post(plugin_command_result))
         .layer(DefaultBodyLimit::max(STUDIO_SYNC_MAX_BODY_BYTES))
+        .layer(middleware::from_fn(local_only_guard))
         .with_state(AppState {
             root: root.clone(),
             dashboard,
+            fs_lock: Arc::new(tokio::sync::Mutex::new(())),
         });
 
     let listener = TcpListener::bind((host, port))
@@ -794,16 +909,102 @@ pub async fn serve(root: PathBuf, port: u16) -> Result<()> {
         .with_context(|| format!("failed to bind nyjo server to {host}:{port}"))?;
 
     println!("nyjo server listening on http://{}:{}/", host, port);
+    println!("Press Ctrl+C to stop.");
     axum::serve(listener, app)
+        .with_graceful_shutdown(async {
+            let _ = tokio::signal::ctrl_c().await;
+            println!("nyjo server shutting down");
+        })
         .await
         .context("nyjo server stopped unexpectedly")
+}
+
+/// Only answer requests that really come from this machine's loopback.
+///
+/// The socket is already bound to 127.0.0.1, but a web page in the user's
+/// browser can still reach it: either via DNS rebinding (a hostile domain that
+/// resolves to 127.0.0.1, which shows up as a foreign `Host` header) or via a
+/// cross-site request (which carries a foreign `Origin` / `Sec-Fetch-Site`).
+/// Studio's HttpService, the CLI and the bundled dashboard pass both checks.
+async fn local_only_guard(request: Request, next: Next) -> Response {
+    if let Err(reason) = check_local_request(request.headers()) {
+        return error_response(StatusCode::FORBIDDEN, anyhow::anyhow!(reason)).into_response();
+    }
+    next.run(request).await
+}
+
+fn check_local_request(headers: &HeaderMap) -> Result<(), String> {
+    let host = headers
+        .get(header::HOST)
+        .and_then(|value| value.to_str().ok())
+        .ok_or_else(|| "missing Host header".to_string())?;
+    if !is_loopback_authority(host) {
+        return Err(format!(
+            "refusing request for host {host:?}; nyjo only serves 127.0.0.1/localhost"
+        ));
+    }
+
+    if let Some(origin) = headers.get(header::ORIGIN) {
+        let origin = origin.to_str().unwrap_or("null");
+        let authority = origin
+            .strip_prefix("http://")
+            .or_else(|| origin.strip_prefix("https://"));
+        if !authority.is_some_and(is_loopback_authority) {
+            return Err(format!("refusing cross-origin request from {origin:?}"));
+        }
+    }
+
+    if headers
+        .get("sec-fetch-site")
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|site| site.eq_ignore_ascii_case("cross-site"))
+    {
+        return Err("refusing cross-site browser request".to_string());
+    }
+
+    Ok(())
+}
+
+fn is_loopback_authority(authority: &str) -> bool {
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        // [::1]:port
+        match rest.split_once(']') {
+            Some((host, tail)) if tail.is_empty() || tail.starts_with(':') => host,
+            _ => return false,
+        }
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) if port.chars().all(|c| c.is_ascii_digit()) => host,
+            Some(_) => return false,
+            None => authority,
+        }
+    };
+    matches!(
+        host.to_ascii_lowercase().as_str(),
+        "127.0.0.1" | "localhost" | "::1"
+    )
+}
+
+/// Run blocking project I/O off the async runtime while holding the
+/// project-wide filesystem lock.
+async fn with_project_fs<T, F>(state: &AppState, work: F) -> Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(PathBuf) -> Result<T> + Send + 'static,
+{
+    let _guard = state.fs_lock.lock().await;
+    let root = state.root.clone();
+    tokio::task::spawn_blocking(move || work(root))
+        .await
+        .context("project worker task panicked")?
 }
 
 async fn health() -> impl IntoResponse {
     success(json!({
         "status": "ok",
         "binding": "127.0.0.1",
-        "version": env!("CARGO_PKG_VERSION")
+        "version": env!("CARGO_PKG_VERSION"),
+        "bridgeProtocol": BRIDGE_PROTOCOL_VERSION
     }))
 }
 
@@ -816,8 +1017,11 @@ async fn info(State(state): State<AppState>) -> impl IntoResponse {
         "status": "ok",
         "binding": "127.0.0.1",
         "version": env!("CARGO_PKG_VERSION"),
+        "bridgeProtocol": BRIDGE_PROTOCOL_VERSION,
         "projectRoot": state.root.display().to_string(),
         "capabilities": {
+            "guardedPush": true,
+            "pushAllowDeletes": true,
             "webDashboard": true,
             "studioBridge": true,
             "controlApi": true,
@@ -891,7 +1095,7 @@ async fn info(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn dashboard_state(State(state): State<AppState>) -> impl IntoResponse {
-    match state.dashboard.lock() {
+    match lock_dashboard(&state.dashboard) {
         Ok(mut dashboard) => {
             dashboard.prune_sessions();
             success(json!(dashboard.snapshot(&state.root)))
@@ -904,7 +1108,7 @@ async fn dashboard_state(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn control_places(State(state): State<AppState>) -> impl IntoResponse {
-    match state.dashboard.lock() {
+    match lock_dashboard(&state.dashboard) {
         Ok(mut dashboard) => {
             dashboard.prune_sessions();
             success(json!(dashboard.places_snapshot()))
@@ -917,7 +1121,7 @@ async fn control_places(State(state): State<AppState>) -> impl IntoResponse {
 }
 
 async fn control_command_state(State(state): State<AppState>) -> impl IntoResponse {
-    match state.dashboard.lock() {
+    match lock_dashboard(&state.dashboard) {
         Ok(mut dashboard) => {
             dashboard.prune_sessions();
             success(json!(dashboard.command_state_snapshot()))
@@ -944,9 +1148,13 @@ async fn queue_control_command(
 }
 
 fn queue_bridge_command(state: AppState, request: QueueBridgeCommandRequest) -> impl IntoResponse {
-    match state.dashboard.lock() {
+    match lock_dashboard(&state.dashboard) {
         Ok(mut dashboard) => {
-            match dashboard.queue_command(request.kind, request.target_session_id.as_deref()) {
+            match dashboard.queue_command_with_options(
+                request.kind,
+                request.target_session_id.as_deref(),
+                request.allow_deletes,
+            ) {
                 Ok(command) => success(json!(QueueBridgeCommandResponse {
                     queued: true,
                     command,
@@ -980,7 +1188,7 @@ fn select_bridge_session(
     state: AppState,
     request: SelectBridgeSessionRequest,
 ) -> impl IntoResponse {
-    match state.dashboard.lock() {
+    match lock_dashboard(&state.dashboard) {
         Ok(mut dashboard) => match dashboard.set_selected_session(request.session_id) {
             Ok(()) => success(json!(SelectBridgeSessionResponse {
                 selected: true,
@@ -1000,7 +1208,7 @@ async fn plugin_heartbeat(
     State(state): State<AppState>,
     Json(request): Json<PluginHeartbeatRequest>,
 ) -> impl IntoResponse {
-    match state.dashboard.lock() {
+    match lock_dashboard(&state.dashboard) {
         Ok(mut dashboard) => {
             dashboard.update_plugin_heartbeat(request);
             success(json!({
@@ -1019,7 +1227,7 @@ async fn plugin_poll(
     State(state): State<AppState>,
     Json(request): Json<PluginPollRequest>,
 ) -> impl IntoResponse {
-    match state.dashboard.lock() {
+    match lock_dashboard(&state.dashboard) {
         Ok(mut dashboard) => success(json!({
             "command": dashboard.take_pending_command(&request.session_id)
         })),
@@ -1034,7 +1242,7 @@ async fn plugin_command_result(
     State(state): State<AppState>,
     Json(request): Json<PluginCommandResultRequest>,
 ) -> impl IntoResponse {
-    match state.dashboard.lock() {
+    match lock_dashboard(&state.dashboard) {
         Ok(mut dashboard) => match dashboard.finish_command(request) {
             Ok(record) => success(json!({
                 "accepted": true,
@@ -1050,7 +1258,7 @@ async fn plugin_command_result(
 }
 
 async fn get_tree(State(state): State<AppState>) -> impl IntoResponse {
-    match scan_project(&state.root) {
+    match with_project_fs(&state, |root| scan_project(&root)).await {
         Ok(tree) => success(json!({ "tree": tree })),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
@@ -1060,7 +1268,7 @@ async fn create_entry(
     State(state): State<AppState>,
     Json(request): Json<CreateRequest>,
 ) -> impl IntoResponse {
-    match create_entry_impl(&state.root, request) {
+    match with_project_fs(&state, move |root| create_entry_impl(&root, request)).await {
         Ok(tree) => success(json!({ "tree": tree })),
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
@@ -1070,7 +1278,7 @@ async fn update_entry(
     State(state): State<AppState>,
     Json(request): Json<UpdateRequest>,
 ) -> impl IntoResponse {
-    match update_entry_impl(&state.root, request) {
+    match with_project_fs(&state, move |root| update_entry_impl(&root, request)).await {
         Ok(tree) => success(json!({ "tree": tree })),
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
@@ -1080,7 +1288,7 @@ async fn delete_entry(
     State(state): State<AppState>,
     Json(request): Json<DeleteRequest>,
 ) -> impl IntoResponse {
-    match delete_entry_impl(&state.root, request) {
+    match with_project_fs(&state, move |root| delete_entry_impl(&root, request)).await {
         Ok(tree) => success(json!({ "tree": tree })),
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
@@ -1090,7 +1298,7 @@ async fn sync_from_studio(
     State(state): State<AppState>,
     Json(request): Json<StudioSyncRequest>,
 ) -> impl IntoResponse {
-    match sync_from_studio_impl(&state.root, request) {
+    match with_project_fs(&state, move |root| sync_from_studio_impl(&root, request)).await {
         Ok(response) => success(json!(response)),
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
@@ -1100,7 +1308,11 @@ async fn create_studio_backup(
     State(state): State<AppState>,
     Json(request): Json<StudioBackupCreateRequest>,
 ) -> impl IntoResponse {
-    match create_studio_backup_impl(&state.root, request) {
+    match with_project_fs(&state, move |root| {
+        create_studio_backup_impl(&root, request)
+    })
+    .await
+    {
         Ok(backup) => success(json!({ "backup": backup })),
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
@@ -1110,7 +1322,7 @@ async fn read_studio_backup(
     State(state): State<AppState>,
     Json(request): Json<StudioBackupReadRequest>,
 ) -> impl IntoResponse {
-    match read_studio_backup_impl(&state.root, request) {
+    match with_project_fs(&state, move |root| read_studio_backup_impl(&root, request)).await {
         Ok(snapshot) => success(json!(snapshot)),
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
@@ -1159,7 +1371,7 @@ fn create_entry_impl(root: &Path, request: CreateRequest) -> Result<crate::model
                     always_embed_header,
                 )?;
             } else {
-                fs::write(&target, request.contents.unwrap_or_default())
+                write_atomic(&target, request.contents.unwrap_or_default())
                     .with_context(|| format!("failed to write file {}", target.display()))?;
 
                 if let Some(metadata) = request.metadata {
@@ -1198,7 +1410,7 @@ fn update_entry_impl(root: &Path, request: UpdateRequest) -> Result<crate::model
     } else {
         validate_fixed_target_metadata(&target, request.metadata.as_ref())?;
         if let Some(contents) = request.contents {
-            fs::write(&target, contents)
+            write_atomic(&target, contents)
                 .with_context(|| format!("failed to write file {}", target.display()))?;
         }
 
@@ -1215,6 +1427,23 @@ fn delete_entry_impl(root: &Path, request: DeleteRequest) -> Result<crate::model
     if !target.exists() {
         bail!("{} does not exist", request.path);
     }
+    if target.is_dir() && !request.recursive && fs::read_dir(&target)?.next().is_some() {
+        bail!(
+            "directory {} is not empty; use recursive=true",
+            request.path
+        );
+    }
+
+    // Deletes through the API are the easiest way for an automated client to
+    // lose work, so always snapshot the project first.
+    let project_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve project root {}", root.display()))?;
+    create_local_project_backup(
+        &project_root,
+        format!("before API delete of {}", request.path),
+        Some(json!({ "path": request.path, "recursive": request.recursive })),
+    )?;
 
     if target.is_dir() {
         if request.recursive {
@@ -1373,6 +1602,11 @@ impl<'a> StudioSyncPlanner<'a> {
                 continue;
             }
 
+            if let Some(reason) = unsafe_local_name_reason(&service_node.name) {
+                self.skip_unsafe_node(self.project_root, service_node, reason);
+                continue;
+            }
+
             self.plan.stats.supported_services += 1;
             let service_dir = self.project_root.join(&service_node.name);
             if !self.plan_directory_target(
@@ -1396,6 +1630,10 @@ impl<'a> StudioSyncPlanner<'a> {
         parent_class: Option<&str>,
         node: &StudioNode,
     ) -> Result<()> {
+        if let Some(reason) = unsafe_local_name_reason(&node.name) {
+            self.skip_unsafe_node(parent_dir, node, reason);
+            return Ok(());
+        }
         if let Some(target_dir) = studio_container_target(parent_dir, node) {
             return self.plan_container_node(&target_dir, parent_class, node);
         }
@@ -1790,6 +2028,24 @@ impl<'a> StudioSyncPlanner<'a> {
         Ok(())
     }
 
+    fn skip_unsafe_node(&mut self, parent_dir: &Path, node: &StudioNode, reason: &str) {
+        let node_count = count_studio_nodes(node);
+        self.plan.stats.skipped_nodes += node_count;
+        self.push_operation(
+            "skip",
+            "unsafeName",
+            format!(
+                "{}/{:?}",
+                display_path(self.project_root, parent_dir),
+                node.name
+            ),
+            format!(
+                "{} {:?} ({} node(s)) was not pulled: {reason}; rename it in Studio to sync it",
+                node.class_name, node.name, node_count
+            ),
+        );
+    }
+
     fn removal_already_scheduled(&self, target: &Path) -> bool {
         self.pending_writes.iter().any(|write| match write {
             PendingWrite::RemoveFile { path } | PendingWrite::RemoveDirectory { path } => {
@@ -1826,6 +2082,14 @@ impl<'a> StudioSyncPlanner<'a> {
 
     fn apply(&mut self) -> Result<()> {
         let pending_writes = std::mem::take(&mut self.pending_writes);
+        // Validate the whole batch before touching anything.
+        for write in &pending_writes {
+            let (PendingWrite::EnsureDirectory { path }
+            | PendingWrite::WriteFile { path, .. }
+            | PendingWrite::RemoveFile { path }
+            | PendingWrite::RemoveDirectory { path }) = write;
+            ensure_inside_project(self.project_root, path)?;
+        }
         for write in pending_writes {
             match write {
                 PendingWrite::EnsureDirectory { path } => {
@@ -1841,8 +2105,7 @@ impl<'a> StudioSyncPlanner<'a> {
                         self.ensure_directory_for_apply(parent)?;
                     }
 
-                    fs::write(&path, contents)
-                        .with_context(|| format!("failed to write {}", path.display()))?;
+                    write_atomic(&path, contents)?;
 
                     match kind {
                         "metadata" => self.plan.stats.metadata_written += 1,
@@ -1879,7 +2142,8 @@ impl<'a> StudioSyncPlanner<'a> {
         ancestors.reverse();
 
         for ancestor in ancestors {
-            if ancestor == self.project_root {
+            // Never inspect (let alone delete) anything at or above the root.
+            if ancestor == self.project_root || !ancestor.starts_with(self.project_root) {
                 continue;
             }
 
@@ -2380,7 +2644,7 @@ fn write_metadata(target: &Path, metadata: NodeMetadata) -> Result<()> {
     }
 
     let contents = serde_json::to_string_pretty(&metadata)?;
-    fs::write(&metadata_path, contents)
+    write_atomic(&metadata_path, contents)
         .with_context(|| format!("failed to write metadata file {}", metadata_path.display()))
 }
 
@@ -2755,7 +3019,7 @@ fn write_embedded_entry_file(
         always_embed_header || metadata.is_some(),
     )?;
 
-    fs::write(target, rendered)
+    write_atomic(target, rendered)
         .with_context(|| format!("failed to write file {}", target.display()))?;
     remove_legacy_metadata(target)
 }
@@ -2777,7 +3041,92 @@ fn resolve_project_path(root: &Path, relative: &str) -> Result<PathBuf> {
         bail!("path cannot be empty");
     }
 
-    Ok(root.join(normalized))
+    if let Some(Component::Normal(first)) = normalized.components().next()
+        && RESERVED_PROJECT_ENTRIES
+            .iter()
+            .any(|reserved| first.to_str() == Some(reserved))
+    {
+        bail!("{relative} is inside a reserved nyjo/git directory");
+    }
+
+    let target = root.join(normalized);
+    ensure_no_symlink_escape(root, &target)?;
+    Ok(target)
+}
+
+/// Lexical checks stop `..`, but a symlink inside the project could still
+/// point outside it. Resolve the deepest existing ancestor and make sure it
+/// is still under the (canonical) project root.
+fn ensure_no_symlink_escape(root: &Path, target: &Path) -> Result<()> {
+    let canonical_root = root
+        .canonicalize()
+        .with_context(|| format!("failed to resolve project root {}", root.display()))?;
+    let mut probe = Some(target);
+    while let Some(candidate) = probe {
+        if fs::symlink_metadata(candidate).is_ok() {
+            let resolved = candidate
+                .canonicalize()
+                .with_context(|| format!("failed to resolve {}", candidate.display()))?;
+            if !resolved.starts_with(&canonical_root) {
+                bail!(
+                    "{} resolves outside the project root (symlink?)",
+                    target.display()
+                );
+            }
+            return Ok(());
+        }
+        probe = candidate.parent();
+    }
+    Ok(())
+}
+
+/// Lexical containment check for paths the Studio-pull planner computed.
+fn ensure_inside_project(project_root: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(project_root).map_err(|_| {
+        anyhow::anyhow!(
+            "refusing to touch {} because it is outside the project root {}",
+            path.display(),
+            project_root.display()
+        )
+    })?;
+    let mut components = relative.components();
+    if let Some(Component::Normal(first)) = components.clone().next()
+        && RESERVED_PROJECT_ENTRIES
+            .iter()
+            .any(|reserved| first.to_str() == Some(reserved))
+    {
+        bail!("refusing to touch reserved path {}", path.display());
+    }
+    if components.any(|component| !matches!(component, Component::Normal(_))) {
+        bail!("refusing to touch non-normalised path {}", path.display());
+    }
+    Ok(())
+}
+
+/// Roblox allows almost anything in `Instance.Name`; the filesystem does not.
+/// Names that cannot be represented 1:1 as a single safe path component are
+/// skipped during pull instead of being joined into a path (where `..`, `/`
+/// or an absolute name would escape the project).
+fn unsafe_local_name_reason(name: &str) -> Option<&'static str> {
+    if name.is_empty() {
+        return Some("empty name");
+    }
+    if name == "." || name == ".." {
+        return Some("name is a relative path segment");
+    }
+    if name.starts_with('.') {
+        return Some("names starting with '.' are hidden and would be ignored by the parser");
+    }
+    if name.contains(['/', '\\']) {
+        return Some("name contains a path separator");
+    }
+    if name.chars().any(char::is_control) {
+        return Some("name contains control characters");
+    }
+    if name.len() > MAX_LOCAL_NAME_BYTES {
+        return Some("name is too long for a file name");
+    }
+    None
 }
 
 fn infer_node_type(target: &Path) -> String {
@@ -3856,14 +4205,14 @@ return 1"#,
         let mut dashboard = DashboardState::default();
         dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
             session_id: "session-a".to_string(),
-            bridge_version: Some("test-bridge".to_string()),
+            bridge_version: Some(super::BRIDGE_PROTOCOL_VERSION.to_string()),
             place_name: Some("PlaceA".to_string()),
             status: Some("idle".to_string()),
             place_id: Some(101),
         });
         dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
             session_id: "session-b".to_string(),
-            bridge_version: Some("test-bridge".to_string()),
+            bridge_version: Some(super::BRIDGE_PROTOCOL_VERSION.to_string()),
             place_name: Some("PlaceB".to_string()),
             status: Some("idle".to_string()),
             place_id: Some(202),
@@ -3884,14 +4233,14 @@ return 1"#,
         let mut dashboard = DashboardState::default();
         dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
             session_id: "session-a".to_string(),
-            bridge_version: Some("test-bridge".to_string()),
+            bridge_version: Some(super::BRIDGE_PROTOCOL_VERSION.to_string()),
             place_name: Some("PlaceA".to_string()),
             status: Some("idle".to_string()),
             place_id: Some(101),
         });
         dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
             session_id: "session-b".to_string(),
-            bridge_version: Some("test-bridge".to_string()),
+            bridge_version: Some(super::BRIDGE_PROTOCOL_VERSION.to_string()),
             place_name: Some("PlaceB".to_string()),
             status: Some("idle".to_string()),
             place_id: Some(202),
@@ -3923,7 +4272,7 @@ return 1"#,
         let mut dashboard = DashboardState::default();
         dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
             session_id: "session-a".to_string(),
-            bridge_version: Some("test-bridge".to_string()),
+            bridge_version: Some(super::BRIDGE_PROTOCOL_VERSION.to_string()),
             place_name: Some("UnitTest".to_string()),
             status: Some("idle".to_string()),
             place_id: Some(101),
@@ -3966,14 +4315,14 @@ return 1"#,
         let mut dashboard = DashboardState::default();
         dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
             session_id: "session-a".to_string(),
-            bridge_version: Some("test-bridge".to_string()),
+            bridge_version: Some(super::BRIDGE_PROTOCOL_VERSION.to_string()),
             place_name: Some("PlaceA".to_string()),
             status: Some("idle".to_string()),
             place_id: Some(101),
         });
         dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
             session_id: "session-b".to_string(),
-            bridge_version: Some("test-bridge".to_string()),
+            bridge_version: Some(super::BRIDGE_PROTOCOL_VERSION.to_string()),
             place_name: Some("PlaceB".to_string()),
             status: Some("idle".to_string()),
             place_id: Some(202),
@@ -4004,5 +4353,220 @@ return 1"#,
 
         assert!(dashboard.last_result.is_none());
         Ok(())
+    }
+
+    #[test]
+    fn dashboard_refuses_commands_for_outdated_plugin_protocol() {
+        let mut dashboard = DashboardState::default();
+        dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
+            session_id: "old".to_string(),
+            bridge_version: Some("nyjo-studio-bridge/1".to_string()),
+            place_name: Some("Old".to_string()),
+            place_id: None,
+            status: None,
+        });
+        let error = dashboard
+            .queue_command(BridgeCommandKind::PushLocalTree, None)
+            .expect_err("old plugin must be refused");
+        assert!(error.to_string().contains("nyjo install"));
+    }
+
+    #[test]
+    fn allow_deletes_is_carried_on_push_and_rejected_elsewhere() -> Result<()> {
+        let mut dashboard = DashboardState::default();
+        dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
+            session_id: "s".to_string(),
+            bridge_version: Some(super::BRIDGE_PROTOCOL_VERSION.to_string()),
+            place_name: None,
+            place_id: None,
+            status: None,
+        });
+        assert!(
+            dashboard
+                .queue_command_with_options(BridgeCommandKind::PreviewPull, None, true)
+                .is_err()
+        );
+        let command =
+            dashboard.queue_command_with_options(BridgeCommandKind::PushLocalTree, None, true)?;
+        assert!(command.allow_deletes);
+        Ok(())
+    }
+
+    #[test]
+    fn stale_pending_and_active_commands_are_expired() -> Result<()> {
+        let mut dashboard = DashboardState::default();
+        dashboard.update_plugin_heartbeat(PluginHeartbeatRequest {
+            session_id: "s".to_string(),
+            bridge_version: Some(super::BRIDGE_PROTOCOL_VERSION.to_string()),
+            place_name: None,
+            place_id: None,
+            status: None,
+        });
+        let queued = dashboard.queue_command(BridgeCommandKind::PushLocalTree, None)?;
+        // Pretend it was queued long ago.
+        if let Some(pending) = dashboard.pending_command.as_mut() {
+            pending.requested_at_ms = 0;
+        }
+        dashboard.prune_sessions();
+        assert!(dashboard.pending_command.is_none());
+        let last = dashboard.last_result.clone().expect("abandon result");
+        assert_eq!(last.command_id, queued.id);
+        assert!(!last.ok);
+
+        // An active command whose session went silent unblocks the bridge.
+        dashboard.queue_command(BridgeCommandKind::PushLocalTree, None)?;
+        dashboard.take_pending_command("s").expect("dispatch");
+        if let Some(session) = dashboard.sessions.get_mut("s") {
+            session.last_seen_ms = 0;
+        }
+        dashboard.prune_sessions();
+        assert!(dashboard.active_command.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn local_guard_accepts_loopback_and_rejects_foreign_hosts_and_origins() {
+        use axum::http::{HeaderMap, HeaderValue, header};
+        let headers = |pairs: &[(&str, &str)]| {
+            let mut map = HeaderMap::new();
+            for (name, value) in pairs {
+                map.insert(
+                    header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                    HeaderValue::from_str(value).unwrap(),
+                );
+            }
+            map
+        };
+        assert!(super::check_local_request(&headers(&[("host", "127.0.0.1:34872")])).is_ok());
+        assert!(super::check_local_request(&headers(&[("host", "localhost:34872")])).is_ok());
+        assert!(super::check_local_request(&headers(&[("host", "[::1]:34872")])).is_ok());
+        assert!(
+            super::check_local_request(&headers(&[
+                ("host", "127.0.0.1:34872"),
+                ("origin", "http://127.0.0.1:34872")
+            ]))
+            .is_ok()
+        );
+        // DNS rebinding
+        assert!(super::check_local_request(&headers(&[("host", "evil.example:34872")])).is_err());
+        assert!(
+            super::check_local_request(&headers(&[("host", "127.0.0.1.evil.example")])).is_err()
+        );
+        // Cross-site
+        assert!(
+            super::check_local_request(&headers(&[
+                ("host", "127.0.0.1:34872"),
+                ("origin", "https://evil.example")
+            ]))
+            .is_err()
+        );
+        assert!(
+            super::check_local_request(&headers(&[
+                ("host", "127.0.0.1:34872"),
+                ("origin", "null")
+            ]))
+            .is_err()
+        );
+        assert!(
+            super::check_local_request(&headers(&[
+                ("host", "127.0.0.1:34872"),
+                ("sec-fetch-site", "cross-site")
+            ]))
+            .is_err()
+        );
+        assert!(super::check_local_request(&HeaderMap::new()).is_err());
+    }
+
+    #[test]
+    fn pull_skips_studio_names_that_would_escape_the_project() -> Result<()> {
+        let parent = tempdir()?;
+        let project = parent.path().join("game");
+        fs::create_dir_all(project.join("ReplicatedStorage"))?;
+        let evil = |name: &str| StudioNode {
+            name: name.to_string(),
+            class_name: "ModuleScript".to_string(),
+            children: Vec::new(),
+            properties: Default::default(),
+            attributes: Default::default(),
+            tags: Vec::new(),
+            source: Some("return 'pwned'".to_string()),
+        };
+        let tree = StudioNode {
+            name: "Studio".to_string(),
+            class_name: "DataModel".to_string(),
+            children: vec![StudioNode {
+                name: "ReplicatedStorage".to_string(),
+                class_name: "ReplicatedStorage".to_string(),
+                children: vec![
+                    evil("../../escaped"),
+                    evil("/tmp/abs"),
+                    evil("a/b"),
+                    evil(".hidden"),
+                    evil(".."),
+                    evil("Fine"),
+                ],
+                properties: Default::default(),
+                attributes: Default::default(),
+                tags: Vec::new(),
+                source: None,
+            }],
+            properties: Default::default(),
+            attributes: Default::default(),
+            tags: Vec::new(),
+            source: None,
+        };
+        let mut request = studio_sync_request(tree);
+        request.mode = StudioSyncMode::Apply;
+        request.force = true;
+        let response = sync_from_studio_impl(&project, request)?;
+
+        assert_eq!(response.plan.stats.skipped_nodes, 5);
+        assert!(project.join("ReplicatedStorage/Fine.lua").is_file());
+        assert!(!parent.path().join("escaped.lua").exists());
+        assert!(!project.join("ReplicatedStorage/a").exists());
+        assert!(!project.join("ReplicatedStorage/.hidden.lua").exists());
+        Ok(())
+    }
+
+    #[test]
+    fn api_paths_reject_reserved_dirs_and_symlink_escapes() -> Result<()> {
+        let parent = tempdir()?;
+        let project = parent.path().join("game");
+        fs::create_dir_all(&project)?;
+        assert!(super::resolve_project_path(&project, ".git/config").is_err());
+        assert!(super::resolve_project_path(&project, ".nyjo-backups/x").is_err());
+        assert!(super::resolve_project_path(&project, "../x").is_err());
+        assert!(super::resolve_project_path(&project, "/etc/passwd").is_err());
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(parent.path(), project.join("link"))?;
+            assert!(super::resolve_project_path(&project, "link/outside.lua").is_err());
+        }
+        assert!(super::resolve_project_path(&project, "Workspace/New.lua").is_ok());
+        Ok(())
+    }
+
+    #[test]
+    fn api_delete_takes_a_backup_first() -> Result<()> {
+        let dir = tempdir()?;
+        fs::create_dir_all(dir.path().join("ReplicatedStorage"))?;
+        fs::write(dir.path().join("ReplicatedStorage/Shared.lua"), "return 1")?;
+        super::delete_entry_impl(
+            dir.path(),
+            super::DeleteRequest {
+                path: "ReplicatedStorage/Shared.lua".to_string(),
+                recursive: false,
+            },
+        )?;
+        assert!(!dir.path().join("ReplicatedStorage/Shared.lua").exists());
+        let backups = crate::backup::list_local_project_backups(&dir.path().canonicalize()?)?;
+        assert_eq!(backups.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn studio_backup_ids_cannot_traverse() {
+        let dir = tempdir().expect("tempdir");
+        assert!(crate::backup::read_studio_tree_backup(dir.path(), "../../etc").is_err());
     }
 }
