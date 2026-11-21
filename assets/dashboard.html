@@ -369,6 +369,7 @@
         <div class="pill-row">
           <div id="bridge-pill" class="pill dead">Bridge offline</div>
           <div id="command-pill" class="pill">Idle</div>
+          <div id="sync-pill" class="pill" title="Compares the local project revision with what the target Studio session last pushed/pulled.">Sync unknown</div>
         </div>
         <div class="meta-grid">
           <div class="meta-block">
@@ -386,6 +387,10 @@
           <div class="meta-block">
             <div class="meta-label">Studio Target</div>
             <div id="place-value" class="meta-value">not connected</div>
+          </div>
+          <div class="meta-block">
+            <div class="meta-label">Local Files</div>
+            <div id="project-value" class="meta-value">loading…</div>
           </div>
         </div>
       </aside>
@@ -449,6 +454,8 @@
     const bindingValue = document.getElementById("binding-value");
     const rootValue = document.getElementById("root-value");
     const placeValue = document.getElementById("place-value");
+    const projectValue = document.getElementById("project-value");
+    const syncPill = document.getElementById("sync-pill");
     const outputPane = document.getElementById("output-pane");
     const resultPane = document.getElementById("result-pane");
     const sessionList = document.getElementById("session-list");
@@ -564,6 +571,41 @@
       await refreshDashboard();
     }
 
+    function heartbeatAgeMs(session) {
+      if (session.sync && typeof session.sync.heartbeatAgeMs === "number") {
+        return session.sync.heartbeatAgeMs;
+      }
+      return Math.max(0, Date.now() - (session.lastSeenMs || 0));
+    }
+
+    function describeHeartbeat(session) {
+      const age = heartbeatAgeMs(session);
+      const seconds = (age / 1000).toFixed(age < 10000 ? 1 : 0);
+      if (session.connected) {
+        return session.sync && session.sync.busy ? `connected • busy • heartbeat ${seconds}s ago` : `connected • heartbeat ${seconds}s ago`;
+      }
+      return `lost • no heartbeat for ${seconds}s`;
+    }
+
+    // null when the plugin is too old to report sync state.
+    function describeDrift(session) {
+      const sync = session.sync;
+      if (!sync) return null;
+      if (sync.localDrift && sync.studioDrift) {
+        return { level: "conflict", text: `⚠ both changed: local rev ${sync.serverRevision} vs synced ${sync.lastSyncedRevision}, ${sync.studioChangesSinceSync} Studio edit(s)` };
+      }
+      if (sync.localDrift) {
+        return { level: "local", text: `local files changed (rev ${sync.serverRevision}, Studio has ${sync.lastSyncedRevision}) — push to update Studio` };
+      }
+      if (sync.studioDrift) {
+        return { level: "studio", text: `${sync.studioChangesSinceSync} Studio edit(s) since last sync — pull to save them` };
+      }
+      if (sync.lastSyncedRevision === undefined || sync.lastSyncedRevision === null) {
+        return { level: "unsynced", text: `not synced yet this session (local rev ${sync.serverRevision})` };
+      }
+      return { level: "insync", text: `in sync at rev ${sync.serverRevision}` };
+    }
+
     function renderSessions(plugin) {
       sessionList.innerHTML = "";
       const sessions = Array.isArray(plugin.sessions) ? plugin.sessions : [];
@@ -592,7 +634,7 @@
         const status = document.createElement("div");
         status.className = "session-meta";
         const statusParts = [];
-        statusParts.push(session.connected ? "connected" : "offline");
+        statusParts.push(describeHeartbeat(session));
         if (session.status) statusParts.push(session.status);
         if (session.selected) {
           statusParts.push("selected");
@@ -606,6 +648,13 @@
         meta.textContent = `${formatSessionTag(session)} • seen ${formatClock(session.lastSeenMs)}`;
 
         card.append(title, status, meta);
+        const drift = describeDrift(session);
+        if (drift) {
+          const driftLine = document.createElement("div");
+          driftLine.className = "session-meta";
+          driftLine.textContent = drift.text;
+          card.appendChild(driftLine);
+        }
         sessionList.appendChild(card);
       }
     }
@@ -650,6 +699,44 @@
       }
 
       renderSessions(plugin);
+
+      const project = server.project || {};
+      const projectParts = [`rev ${project.revision ?? "?"}`];
+      if (project.watcher) projectParts.push(`watch: ${project.watcher}`);
+      if (project.lastChangeMs) projectParts.push(`changed ${formatClock(project.lastChangeMs)}`);
+      if (project.scanError) projectParts.push(`PARSE ERROR: ${project.scanError}`);
+      else if (Array.isArray(project.recentChanges) && project.recentChanges.length > 0) {
+        projectParts.push(`last: ${project.recentChanges.slice(0, 3).join(", ")}`);
+      }
+      projectValue.textContent = projectParts.join(" • ");
+
+      const syncTarget = targetSession && targetSession.connected ? targetSession : null;
+      const drift = syncTarget ? describeDrift(syncTarget) : null;
+      if (project.scanError) {
+        syncPill.className = "pill dead";
+        syncPill.textContent = "Local files do not parse";
+      } else if (!syncTarget) {
+        syncPill.className = "pill";
+        syncPill.textContent = "Sync unknown";
+      } else if (!drift) {
+        syncPill.className = "pill";
+        syncPill.textContent = "Plugin too old for sync status";
+      } else if (drift.level === "insync") {
+        syncPill.className = "pill live";
+        syncPill.textContent = `In sync (rev ${project.revision})`;
+      } else if (drift.level === "conflict") {
+        syncPill.className = "pill dead";
+        syncPill.textContent = "Both sides changed";
+      } else if (drift.level === "local") {
+        syncPill.className = "pill busy";
+        syncPill.textContent = "Local changes not in Studio";
+      } else if (drift.level === "studio") {
+        syncPill.className = "pill busy";
+        syncPill.textContent = "Studio changes not saved";
+      } else {
+        syncPill.className = "pill";
+        syncPill.textContent = "Not synced yet";
+      }
 
       const canQueue = Boolean(plugin.targetSessionId) && !pending && !active;
       for (const button of studioButtons) {
@@ -783,11 +870,21 @@
         setToast("Waiting for server or Studio bridge.");
       }
 
+      // 1s refresh to match the plugin heartbeat; never overlap requests.
+      let refreshing = false;
       window.setInterval(() => {
-        refreshDashboard().catch((error) => {
-          setToast(`Dashboard refresh failed: ${error.message}`);
-        });
-      }, 1500);
+        if (refreshing) return;
+        refreshing = true;
+        refreshDashboard()
+          .catch((error) => {
+            bridgePill.className = "pill dead";
+            bridgePill.textContent = "nyjo server unreachable";
+            setToast(`Dashboard refresh failed: ${error.message}`);
+          })
+          .finally(() => {
+            refreshing = false;
+          });
+      }, 1000);
     }
 
     boot();

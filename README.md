@@ -24,7 +24,7 @@ It scans a Linux-friendly project folder, turns it into a Roblox-style instance 
 
 `local filesystem <-> instance tree <-> Studio snapshot`
 
-The local parser reads your project folder and converts it into an internal Roblox-shaped tree. The local server exposes that tree, the browser dashboard shows state and logs, and the Studio plugin bridge polls the server for commands and sends supported Studio snapshots back.
+The local parser reads your project folder and converts it into an internal Roblox-shaped tree. The local server exposes that tree, the browser dashboard shows state and logs, and the Studio plugin bridge exchanges a small heartbeat with the server every second (state in, revision + queued command out) and sends supported Studio snapshots back.
 
 In practice, the flow looks like this:
 
@@ -307,7 +307,7 @@ Pushing into Studio is guarded because an earlier version could delete large par
 The Roblox Studio plugin is a local bridge, not the main source of truth. Its job is to:
 
 - Connect Studio to the local `nyjo` server
-- Poll for commands
+- Exchange a 1-second heartbeat with the server (see below)
 - Send Studio-side snapshot data back
 - Run supported preview/apply operations
 
@@ -315,12 +315,20 @@ Each open Studio window now gets its own bridge session id, so queued dashboard 
 
 The local files and local parser remain the core model.
 
+### Live Sync Status (1s heartbeat)
+
+- `nyjo serve` watches the project folder (inotify via `notify`, falling back to 1s polling) and keeps a **project revision** that goes up only when the parsed tree really changes. Edits are picked up in ~150 ms; `.git`, `.nyjo-backups`, editor swap/temp files and identical re-saves are ignored.
+- Every second the plugin calls `POST /api/plugin/sync` with its state, the revision it last pushed/pulled, and how many Studio edits it noticed since then. The reply carries the current revision, parse errors, recently changed files and any queued command, which the plugin starts right away (one round trip, no separate poll).
+- If the server is unreachable the plugin retries every 1–2 s and snaps back to 1 s on the first reply. No reply for more than 3 s shows as **connection lost**, in the plugin and on the dashboard.
+- Drift is shown, never acted on: "local files changed → push", "Studio edited → pull", or "both changed → review with Preview Pull". Nothing is pushed or pulled automatically, and all push safety rules above still apply.
+- Studio-side detection counts instances added/removed under synced services, script edits and undo/redo; plain property edits (e.g. moving a part) are not counted.
+
 ## Current Limitations
 
 - This is still an early tool and does not claim full Roblox property coverage
 - Round-tripping is strongest for the currently supported file types and translated properties
 - Conflict handling exists, but full two-sided reconciliation is still a work in progress
-- `nyjo watch` and `nyjo diff` CLI commands are not implemented yet
+- `nyjo diff` is not implemented yet; `nyjo serve` watches files for drift display but never syncs automatically
 - Auto-install of the plugin targets TuxBlox and Vinegar; use `--plugins-dir` for anything else
 
 For a more detailed project status and roadmap, see [TASK.md](TASK.md).
