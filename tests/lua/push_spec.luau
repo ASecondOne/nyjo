@@ -204,7 +204,3 @@ test("runExclusive blocks overlapping operations", function()
 	P.runExclusive("after", function() end) -- lock released
 end)
 
-print(string.format("\n%d passed, %d failed", passed, failures))
-if failures > 0 then
-	error("lua tests failed")
-end

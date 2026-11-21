@@ -22,8 +22,18 @@ local BRIDGE_VERSION = "nyjo-studio-bridge/2"
 -- half-empty local tree wiping the place.
 local MAX_PUSH_DELETED_INSTANCES = 200
 local TRASH_FOLDER_NAME = "NyjoTrash"
-local POLL_INTERVAL_SECONDS = 1
-local MAX_POLL_BACKOFF_SECONDS = 15
+-- The plugin and the server have a small "conversation" every second: the
+-- plugin reports its state and the project revision it last synced against,
+-- the server answers with its current revision and any queued command.
+local HEARTBEAT_INTERVAL_SECONDS = 1
+-- While the server is unreachable, retry at most every 2 seconds and go back
+-- to 1s on the first reply, so reconnects are noticed almost immediately.
+local MAX_HEARTBEAT_BACKOFF_SECONDS = 2
+-- No reply for longer than this = connection shown as lost.
+local CONNECTION_LOST_AFTER_MS = 3000
+-- Studio changes noticed right after Nyjo itself edited the place (deferred
+-- signals from a push/restore) are not counted as user edits.
+local OWN_EDIT_QUIET_MS = 750
 -- Properties Nyjo never writes from local data: identity is name + class and
 -- the tree structure, not a property map.
 local PROTECTED_PROPERTIES = {
@@ -393,9 +403,22 @@ restoreStudioBackupButton.TextSize = 16
 restoreStudioBackupButton.Text = "Restore Studio Backup"
 restoreStudioBackupButton.Parent = safetyRow
 
+local syncStatusLabel = Instance.new("TextLabel")
+syncStatusLabel.Name = "SyncStatus"
+syncStatusLabel.LayoutOrder = 8
+syncStatusLabel.BackgroundTransparency = 1
+syncStatusLabel.Size = UDim2.new(1, 0, 0, 20)
+syncStatusLabel.Font = Enum.Font.SourceSansSemibold
+syncStatusLabel.TextColor3 = SECONDARY_TEXT
+syncStatusLabel.TextSize = 15
+syncStatusLabel.TextXAlignment = Enum.TextXAlignment.Left
+syncStatusLabel.TextTruncate = Enum.TextTruncate.AtEnd
+syncStatusLabel.Text = "○ Connecting to nyjo..."
+syncStatusLabel.Parent = root
+
 local status = Instance.new("TextBox")
 status.Name = "Status"
-status.LayoutOrder = 8
+status.LayoutOrder = 9
 status.MultiLine = true
 status.ClearTextOnFocus = false
 status.TextEditable = false
@@ -1756,6 +1779,42 @@ end
 
 local operationInProgress = nil
 
+local function nowMs()
+	return DateTime.now().UnixTimestampMillis
+end
+
+-- What the plugin knows about "are Studio and the local files in sync?".
+local syncState = {
+	-- Project revision Studio was last pushed from / pulled into (nil = never
+	-- synced in this session).
+	lastSyncedRevision = nil,
+	-- Latest project revision reported by the server.
+	serverRevision = nil,
+	-- Studio edits noticed since the last push/pull.
+	studioChanges = 0,
+	lastReplyMs = nil,
+	scanError = nil,
+	recentChanges = nil,
+	connectionError = nil,
+	commandRunning = false,
+	quietUntilMs = 0,
+}
+
+local function markSynced(revision)
+	if typeof(revision) == "number" then
+		syncState.lastSyncedRevision = revision
+	end
+	syncState.studioChanges = 0
+	syncState.quietUntilMs = nowMs() + OWN_EDIT_QUIET_MS
+end
+
+local function noteStudioChange()
+	if operationInProgress ~= nil or nowMs() < syncState.quietUntilMs then
+		return
+	end
+	syncState.studioChanges = syncState.studioChanges + 1
+end
+
 -- Only one push/pull/restore at a time, whether it came from a button or
 -- from the dashboard/CLI bridge.
 local function runExclusive(label, fn, ...)
@@ -1765,6 +1824,7 @@ local function runExclusive(label, fn, ...)
 	operationInProgress = label
 	local results = table.pack(pcall(fn, ...))
 	operationInProgress = nil
+	syncState.quietUntilMs = nowMs() + OWN_EDIT_QUIET_MS
 	if not results[1] then
 		error(results[2], 0)
 	end
@@ -1793,10 +1853,14 @@ local function pushLocalTree(updateStatus, allowDeletes)
 		error("server response did not contain a tree; nothing was changed", 0)
 	end
 	local backup = createStudioBackup("before push local tree", captureStudioTree(), true)
-	return pushTree(tree, updateStatus, {
+	local result = pushTree(tree, updateStatus, {
 		backup = backup,
 		allowDeletes = allowDeletes == true,
 	})
+	-- Studio now reflects this revision of the local files. (With deletes
+	-- off, extra Studio-only instances may remain; that is by design.)
+	markSynced(decoded.data.revision)
+	return result
 end
 
 local function restoreStudioBackup(updateStatus)
@@ -1820,11 +1884,15 @@ local function restoreStudioBackup(updateStatus)
 		error("backup response did not contain a tree")
 	end
 
-	return pushTree(tree, updateStatus, {
+	local result = pushTree(tree, updateStatus, {
 		headline = "Studio restore complete.",
 		restoredBackup = data.backup,
 		rescueBackup = rescueBackup,
 	})
+	-- Studio now matches a backup, not the local files.
+	syncState.lastSyncedRevision = nil
+	syncState.studioChanges = 1
+	return result
 end
 
 local function syncFromStudio(mode, force, updateStatus)
@@ -1843,6 +1911,9 @@ local function syncFromStudio(mode, force, updateStatus)
 	local plan = data.plan or {}
 	local stats = plan.stats or {}
 	local returnedTree = data.tree
+	if mode ~= "preview" and data.applied == true and not data.blocked then
+		markSynced(data.revision)
+	end
 	local studioNodes = 0
 	for _, serviceNode in ipairs(tree.children) do
 		studioNodes = studioNodes + countSnapshotDescendants(serviceNode)
@@ -1924,7 +1995,8 @@ local bridgeState = {
 local placeInfoCache = {
 	placeId = nil,
 	resolvedName = nil,
-	lastAttempt = 0,
+	lastAttempt = -math.huge,
+	inFlight = false,
 }
 
 resolveBridgePlaceName = function()
@@ -1937,7 +2009,7 @@ resolveBridgePlaceName = function()
 	if placeInfoCache.placeId ~= placeId then
 		placeInfoCache.placeId = placeId
 		placeInfoCache.resolvedName = nil
-		placeInfoCache.lastAttempt = 0
+		placeInfoCache.lastAttempt = -math.huge
 	end
 
 	if typeof(placeInfoCache.resolvedName) == "string" and placeInfoCache.resolvedName ~= "" then
@@ -1945,7 +2017,7 @@ resolveBridgePlaceName = function()
 	end
 
 	local now = os.clock()
-	if now - placeInfoCache.lastAttempt < 30 then
+	if placeInfoCache.inFlight or now - placeInfoCache.lastAttempt < 30 then
 		return fallbackName
 	end
 	placeInfoCache.lastAttempt = now
@@ -1955,14 +2027,18 @@ resolveBridgePlaceName = function()
 		return fallbackName
 	end
 
-	local ok, info = pcall(getProductInfo, MarketplaceService, placeId, Enum.InfoType.Asset)
-	if ok and typeof(info) == "table" then
-		local name = info.Name
-		if typeof(name) == "string" and name ~= "" then
-			placeInfoCache.resolvedName = name
-			return name
+	-- The web lookup can take seconds; never let it stall the 1s heartbeat.
+	placeInfoCache.inFlight = true
+	task.spawn(function()
+		local ok, info = pcall(getProductInfo, MarketplaceService, placeId, Enum.InfoType.Asset)
+		placeInfoCache.inFlight = false
+		if ok and typeof(info) == "table" and placeInfoCache.placeId == placeId then
+			local name = info.Name
+			if typeof(name) == "string" and name ~= "" then
+				placeInfoCache.resolvedName = name
+			end
 		end
-	end
+	end)
 
 	return fallbackName
 end
@@ -1973,13 +2049,17 @@ local function reportBridgeHeartbeat()
 		heartbeatStatus = "error: " .. bridgeState.lastError
 	end
 
-	return tryPostJson("/api/plugin/heartbeat", {
+	local ok, result = tryPostJson("/api/plugin/heartbeat", {
 		sessionId = BRIDGE_SESSION_ID,
 		bridgeVersion = BRIDGE_VERSION,
 		placeName = resolveBridgePlaceName(),
 		placeId = game.PlaceId ~= 0 and game.PlaceId or nil,
 		status = heartbeatStatus,
 	})
+	if ok then
+		syncState.lastReplyMs = nowMs()
+	end
+	return ok, result
 end
 
 local function reportBridgeCommandResult(commandId, ok, summary, detail, data)
@@ -2021,7 +2101,139 @@ local function executeBridgeCommand(command)
 	error("unsupported bridge command " .. tostring(kind))
 end
 
-local function bridgePollOnce()
+local function bridgeStatusText()
+	local heartbeatStatus = bridgeState.status
+	if bridgeState.lastError ~= nil then
+		heartbeatStatus = "error: " .. bridgeState.lastError
+	end
+	return heartbeatStatus
+end
+
+local function runBridgeCommand(command)
+	bridgeState.status = "running " .. tostring(command.kind or "command")
+	local success, commandOk, summary, detail, data = pcall(executeBridgeCommand, command)
+	bridgeState.status = "idle"
+
+	if not success then
+		local errorMessage = tostring(commandOk)
+		bridgeState.lastError = errorMessage
+		reportBridgeCommandResult(command.id, false, "Studio bridge command failed", errorMessage, nil)
+		setStatus("Bridge command failed.\n\n" .. errorMessage)
+	else
+		bridgeState.lastError = nil
+		reportBridgeCommandResult(command.id, commandOk, summary, detail, data)
+	end
+end
+
+local function buildSyncPayload()
+	return {
+		sessionId = BRIDGE_SESSION_ID,
+		bridgeVersion = BRIDGE_VERSION,
+		placeName = resolveBridgePlaceName(),
+		placeId = game.PlaceId ~= 0 and game.PlaceId or nil,
+		status = bridgeStatusText(),
+		busy = syncState.commandRunning or operationInProgress ~= nil,
+		lastSyncedRevision = syncState.lastSyncedRevision,
+		studioChangesSinceSync = syncState.studioChanges,
+	}
+end
+
+-- Next wait between heartbeats: 1s while connected; on failure 1s -> 2s and
+-- capped there; the first successful reply snaps straight back to 1s.
+local function nextHeartbeatDelay(succeeded, currentDelay)
+	if succeeded then
+		return HEARTBEAT_INTERVAL_SECONDS
+	end
+	return math.min(math.max(currentDelay, HEARTBEAT_INTERVAL_SECONDS) * 2, MAX_HEARTBEAT_BACKOFF_SECONDS)
+end
+
+-- One-line connection + drift summary shown above the output box.
+local function describeSyncState(now)
+	now = now or nowMs()
+	if syncState.lastReplyMs == nil or now - syncState.lastReplyMs > CONNECTION_LOST_AFTER_MS then
+		local suffix = ""
+		if syncState.lastReplyMs ~= nil then
+			suffix = string.format(" (no reply for %ds)", math.floor((now - syncState.lastReplyMs) / 1000))
+		end
+		return "lost", "○ Connection to nyjo lost" .. suffix .. " · retrying"
+	end
+
+	local revisionText = syncState.serverRevision and ("rev " .. tostring(syncState.serverRevision)) or "rev ?"
+	local prefix = "● Connected · " .. revisionText .. " · "
+	if syncState.scanError ~= nil then
+		return "error", prefix .. "local files do not parse: " .. syncState.scanError
+	end
+	if syncState.commandRunning or operationInProgress ~= nil then
+		return "busy", prefix .. "working (" .. tostring(operationInProgress or bridgeState.status) .. ")"
+	end
+
+	local localDrift = syncState.lastSyncedRevision ~= nil
+		and syncState.serverRevision ~= nil
+		and syncState.serverRevision ~= syncState.lastSyncedRevision
+	local studioDrift = syncState.studioChanges > 0
+	if localDrift and studioDrift then
+		return "conflict", prefix .. "both local files and Studio changed since last sync; review with Preview Pull"
+	elseif localDrift then
+		local changed = ""
+		if typeof(syncState.recentChanges) == "table" and typeof(syncState.recentChanges[1]) == "string" then
+			changed = " (" .. syncState.recentChanges[1] .. ")"
+		end
+		return "local", prefix .. "local files changed since last sync" .. changed .. "; push to update Studio"
+	elseif studioDrift then
+		return "studio", prefix .. string.format("%d Studio edit(s) since last sync; pull to save them", syncState.studioChanges)
+	elseif syncState.lastSyncedRevision == nil then
+		return "unsynced", prefix .. "not synced yet in this session"
+	end
+	return "insync", prefix .. "in sync"
+end
+
+local function refreshSyncLabel()
+	local _, text = describeSyncState()
+	if syncStatusLabel.Text ~= text then
+		syncStatusLabel.Text = text
+	end
+end
+
+local bridgePollOnce
+
+-- One heartbeat round trip. Returns true when the server answered.
+local function bridgeSyncOnce()
+	local ok, response = tryPostJson("/api/plugin/sync", buildSyncPayload())
+	if not ok then
+		local message = tostring(response)
+		if string.find(message, "HTTP 404", 1, true) then
+			-- Older nyjo server without the sync endpoint.
+			return bridgePollOnce()
+		end
+		syncState.connectionError = message
+		return false
+	end
+
+	local data = response and response.data or {}
+	syncState.lastReplyMs = nowMs()
+	syncState.connectionError = nil
+	local project = typeof(data.project) == "table" and data.project or {}
+	if typeof(project.revision) == "number" then
+		syncState.serverRevision = project.revision
+	end
+	syncState.scanError = typeof(project.scanError) == "string" and project.scanError or nil
+	syncState.recentChanges = project.recentChanges
+
+	local command = data.command
+	if typeof(command) == "table" and typeof(command.id) == "number" and not syncState.commandRunning then
+		-- Run it right away, but on its own thread so heartbeats keep flowing
+		-- (reported as busy) while a long push or pull is in progress.
+		syncState.commandRunning = true
+		task.spawn(function()
+			runBridgeCommand(command)
+			syncState.commandRunning = false
+		end)
+	end
+	return true
+end
+
+-- Fallback for nyjo servers without /api/plugin/sync (heartbeat + poll).
+bridgePollOnce = function()
 	local heartbeatOk, heartbeatResult = reportBridgeHeartbeat()
 	if not heartbeatOk then
 		bridgeState.lastError = tostring(heartbeatResult)
@@ -2044,28 +2256,8 @@ local function bridgePollOnce()
 		return true
 	end
 
-	bridgeState.status = "running " .. tostring(command.kind or "command")
-	reportBridgeHeartbeat()
-
-	local success, commandOk, summary, detail, data = pcall(executeBridgeCommand, command)
-	bridgeState.status = "idle"
-
-	if not success then
-		local errorMessage = tostring(commandOk)
-		bridgeState.lastError = errorMessage
-		reportBridgeCommandResult(
-			command.id,
-			false,
-			"Studio bridge command failed",
-			errorMessage,
-			nil
-		)
-		setStatus("Bridge command failed.\n\n" .. errorMessage)
-	else
-		bridgeState.lastError = nil
-		reportBridgeCommandResult(command.id, commandOk, summary, detail, data)
-	end
-
+	-- Legacy servers only: run inline (they lack the busy-aware sync endpoint).
+	runBridgeCommand(command)
 	reportBridgeHeartbeat()
 	return true
 end
@@ -2188,6 +2380,49 @@ end)
 
 portBox.Text = tostring(readPort())
 
+local function isNyjoTrash(instance)
+	return instance.Name == TRASH_FOLDER_NAME or instance:FindFirstAncestor(TRASH_FOLDER_NAME) ~= nil
+end
+
+-- Cheap Studio-side change detection for drift display only (it never
+-- triggers a sync): instances added/removed under synced services, script
+-- edits, and undo/redo. Plain property edits are not tracked.
+local function connectStudioChangeTracking()
+	local function connect(signal, handler)
+		if signal ~= nil then
+			pcall(function()
+				signal:Connect(handler)
+			end)
+		end
+	end
+	local function onInstanceChange(instance)
+		local ok, trashed = pcall(isNyjoTrash, instance)
+		if ok and trashed then
+			return
+		end
+		noteStudioChange()
+	end
+
+	for className in pairs(ROOT_SERVICE_CLASSES) do
+		local ok, service = pcall(game.GetService, game, className)
+		if ok and service ~= nil then
+			connect(service.DescendantAdded, onInstanceChange)
+			connect(service.DescendantRemoving, onInstanceChange)
+		end
+	end
+	connect(ScriptEditorService.TextDocumentDidChange, function(document)
+		local ok, isCommandBar = pcall(function()
+			return document:IsCommandBar()
+		end)
+		if ok and isCommandBar then
+			return
+		end
+		noteStudioChange()
+	end)
+	connect(ChangeHistoryService.OnUndo, noteStudioChange)
+	connect(ChangeHistoryService.OnRedo, noteStudioChange)
+end
+
 local pluginUnloading = false
 plugin.Unloading:Connect(function()
 	pluginUnloading = true
@@ -2198,28 +2433,24 @@ if RunService:IsRunning() then
 	-- when the test stops, so never register them as a bridge target.
 	setStatus("Nyjo bridge is disabled during playtests. Stop the playtest to sync.")
 else
+	connectStudioChangeTracking()
+
+	-- The 1s heartbeat ("conversation") with the nyjo server.
 	task.spawn(function()
-		local delaySeconds = POLL_INTERVAL_SECONDS
-		local wasConnected = nil
+		local delaySeconds = HEARTBEAT_INTERVAL_SECONDS
 		while not pluginUnloading do
-			local ok, connected = pcall(bridgePollOnce)
-			connected = ok and connected == true
-			if connected then
-				delaySeconds = POLL_INTERVAL_SECONDS
-			else
-				-- Back off while the server is down instead of hammering
-				-- HttpService (and the Output window) every second.
-				delaySeconds = math.min(delaySeconds * 2, MAX_POLL_BACKOFF_SECONDS)
-			end
-			if connected ~= wasConnected and operationInProgress == nil then
-				if connected then
-					setStatus("Connected to nyjo at " .. dashboardUrl())
-				elseif wasConnected ~= nil then
-					setStatus("Lost connection to nyjo at " .. dashboardUrl() .. "; retrying...\n\n" .. tostring(bridgeState.lastError or ""))
-				end
-			end
-			wasConnected = connected
+			local ok, connected = pcall(bridgeSyncOnce)
+			delaySeconds = nextHeartbeatDelay(ok and connected == true, delaySeconds)
+			refreshSyncLabel()
 			task.wait(delaySeconds)
+		end
+	end)
+
+	-- Keep the connection label honest even if a request hangs.
+	task.spawn(function()
+		while not pluginUnloading do
+			refreshSyncLabel()
+			task.wait(0.5)
 		end
 	end)
 end

@@ -182,6 +182,11 @@ local SUPER = {
 }
 
 M.failNameSetFor = {}
+-- Wall clock seen by the plugin via DateTime.now(); tests move it by hand.
+M.nowMs = 1700000000000
+-- When true, task.spawn runs the function immediately (the plugin's endless
+-- heartbeat loops are started while this is still false).
+M.runSpawned = false
 local Methods = {}
 local InstMT = {}
 
@@ -214,7 +219,17 @@ InstMT.__index = function(t, k)
 	if v ~= nil then
 		return v
 	end
-	if string.match(k, "Click$") or k == "FocusLost" or k == "Changed" or k == "Unloading" then
+	if
+		string.match(k, "Click$")
+		or k == "FocusLost"
+		or k == "Changed"
+		or k == "Unloading"
+		or k == "DescendantAdded"
+		or k == "DescendantRemoving"
+		or k == "TextDocumentDidChange"
+		or k == "OnUndo"
+		or k == "OnRedo"
+	then
 		t.__signals[k] = t.__signals[k] or newSignal()
 		return t.__signals[k]
 	end
@@ -307,6 +322,16 @@ function Methods.GetPropertyChangedSignal(self, prop)
 	return self.__signals["prop:" .. prop]
 end
 function Methods.SetActive() end
+function Methods.FindFirstAncestor(self, name)
+	local n = rawget(self, "__parent")
+	while n do
+		if n.Name == name then
+			return n
+		end
+		n = rawget(n, "__parent")
+	end
+	return nil
+end
 
 -------------------------------------------------------------------------------
 -- Environment
@@ -424,6 +449,7 @@ function M.install(env)
 	env.DateTime = {
 		now = function()
 			return {
+				UnixTimestampMillis = M.nowMs,
 				FormatUniversalTime = function()
 					return "20261121T120000Z"
 				end,
@@ -439,7 +465,11 @@ function M.install(env)
 		end,
 	}
 	env.task = {
-		spawn = function() end,
+		spawn = function(fn, ...)
+			if M.runSpawned then
+				fn(...)
+			end
+		end,
 		wait = function() end,
 	}
 	env.warn = function() end
