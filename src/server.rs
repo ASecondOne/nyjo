@@ -26,12 +26,14 @@ use crate::control::{
     BridgeCommandEnvelope, BridgeCommandKind, BridgeCommandResult, BridgeCommandState,
     BridgePlacesSnapshot, BridgeSessionSnapshot, QueueBridgeCommandRequest,
     QueueBridgeCommandResponse, SelectBridgeSessionRequest, SelectBridgeSessionResponse,
+    SessionSyncSnapshot,
 };
 use crate::fsutil::write_atomic;
 use crate::model::{InstanceNode, NodeMetadata};
 use crate::parser::{
     ROOT_SERVICE_CLASSES, metadata_path_for_target, read_embedded_text_payload, scan_project,
 };
+use crate::revision::{POLL_WATCH_INTERVAL, ProjectRevision, WATCH_DEBOUNCE, relevant_change_path};
 
 #[derive(Clone)]
 struct AppState {
@@ -40,6 +42,9 @@ struct AppState {
     /// Serialises everything that reads or writes the project on disk so two
     /// requests (e.g. a pull and an API edit) can never interleave writes.
     fs_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Monotonic revision of the parsed project tree, bumped by the file
+    /// watcher and by our own writes.
+    revision: ProjectRevision,
 }
 
 /// Studio plugin protocol this server speaks. Bumped to 2 for the guarded
@@ -107,7 +112,8 @@ const LOGICAL_NODE_FILE_SUFFIXES: &[&str] = &[
 const DASHBOARD_HTML: &str = include_str!("../assets/dashboard.html");
 const DIRECTORY_HEADER_FILE_NAME: &str = ".nyjo";
 const LOG_BUFFER_LIMIT: usize = 200;
-const PLUGIN_CONNECTION_TIMEOUT_MS: u64 = 5_000;
+/// The plugin heartbeats every second; three missed beats mean "lost".
+const PLUGIN_CONNECTION_TIMEOUT_MS: u64 = 3_000;
 const PLUGIN_SESSION_RETENTION_MS: u64 = 60_000;
 const STUDIO_SYNC_MAX_BODY_BYTES: usize = 128 * 1024 * 1024;
 
@@ -120,6 +126,7 @@ struct DashboardState {
     selected_session_id: Option<String>,
     last_result: Option<BridgeCommandResult>,
     logs: Vec<DashboardLogEntry>,
+    revision: ProjectRevision,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +137,15 @@ struct BridgeSessionRecord {
     place_id: Option<u64>,
     status: Option<String>,
     last_seen_ms: u64,
+    /// Sync bookkeeping reported by `/api/plugin/sync` heartbeats.
+    sync: Option<PluginSyncReport>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PluginSyncReport {
+    last_synced_revision: Option<u64>,
+    studio_changes_since_sync: u64,
+    busy: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -185,6 +201,33 @@ struct PluginHeartbeatRequest {
     place_id: Option<u64>,
     #[serde(default)]
     status: Option<String>,
+}
+
+/// One-request-per-second "conversation" with the plugin: it carries the
+/// heartbeat plus the plugin's sync bookkeeping, and the reply carries the
+/// server's current project revision and any pending command.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PluginSyncRequest {
+    session_id: String,
+    #[serde(default)]
+    bridge_version: Option<String>,
+    #[serde(default)]
+    place_name: Option<String>,
+    #[serde(default)]
+    place_id: Option<u64>,
+    #[serde(default)]
+    status: Option<String>,
+    /// Project revision the plugin last pushed or pulled against.
+    #[serde(default)]
+    last_synced_revision: Option<u64>,
+    /// Studio-side edits the plugin noticed since that sync.
+    #[serde(default)]
+    studio_changes_since_sync: u64,
+    /// True while the plugin is executing a command; no new command is
+    /// handed out in that case.
+    #[serde(default)]
+    busy: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -502,6 +545,42 @@ impl DashboardState {
     }
 
     fn update_plugin_heartbeat(&mut self, heartbeat: PluginHeartbeatRequest) {
+        let sync = self
+            .sessions
+            .get(&heartbeat.session_id)
+            .and_then(|session| session.sync.clone());
+        self.record_heartbeat(heartbeat, sync);
+    }
+
+    fn update_plugin_sync(&mut self, request: PluginSyncRequest) -> Option<BridgeCommandEnvelope> {
+        let busy = request.busy;
+        let session_id = request.session_id.clone();
+        self.record_heartbeat(
+            PluginHeartbeatRequest {
+                session_id: request.session_id,
+                bridge_version: request.bridge_version,
+                place_name: request.place_name,
+                place_id: request.place_id,
+                status: request.status,
+            },
+            Some(PluginSyncReport {
+                last_synced_revision: request.last_synced_revision,
+                studio_changes_since_sync: request.studio_changes_since_sync,
+                busy,
+            }),
+        );
+        if busy {
+            None
+        } else {
+            self.take_pending_command(&session_id)
+        }
+    }
+
+    fn record_heartbeat(
+        &mut self,
+        heartbeat: PluginHeartbeatRequest,
+        sync: Option<PluginSyncReport>,
+    ) {
         self.prune_sessions();
         let session_id = heartbeat.session_id;
         let was_connected = self
@@ -515,6 +594,7 @@ impl DashboardState {
             place_id: heartbeat.place_id,
             status: heartbeat.status,
             last_seen_ms: now_ms(),
+            sync,
         };
 
         if !was_connected {
@@ -600,7 +680,9 @@ impl DashboardState {
                 "version": env!("CARGO_PKG_VERSION"),
                 "binding": "127.0.0.1",
                 "projectRoot": root.display().to_string(),
-                "dashboardPath": "/"
+                "dashboardPath": "/",
+                "connectionTimeoutMs": PLUGIN_CONNECTION_TIMEOUT_MS,
+                "project": self.revision.snapshot()
             }),
             plugin: DashboardPluginSnapshot {
                 connected: places.connected,
@@ -643,19 +725,43 @@ impl DashboardState {
         }
     }
 
+    /// A session executing a long command (e.g. a big push that does not
+    /// yield) may miss a heartbeat or two; it is still connected.
+    fn is_busy_session(&self, session_id: &str) -> bool {
+        self.active_command
+            .as_ref()
+            .is_some_and(|command| command.target_session_id == session_id)
+    }
+
     fn session_snapshots(&self) -> Vec<BridgeSessionSnapshot> {
+        let now = now_ms();
+        let server_revision = self.revision.current();
         let mut sessions: Vec<_> = self
             .sessions
             .values()
             .map(|session| BridgeSessionSnapshot {
                 session_id: session.session_id.clone(),
-                connected: session.connected(),
+                connected: session.connected() || self.is_busy_session(&session.session_id),
                 selected: self.selected_session_id.as_deref() == Some(session.session_id.as_str()),
                 bridge_version: session.bridge_version.clone(),
                 place_name: session.place_name.clone(),
                 place_id: session.place_id,
                 status: session.status.clone(),
                 last_seen_ms: session.last_seen_ms,
+                sync: session.sync.as_ref().map(|sync| {
+                    let local_drift = sync
+                        .last_synced_revision
+                        .is_some_and(|synced| synced != server_revision);
+                    SessionSyncSnapshot {
+                        heartbeat_age_ms: now.saturating_sub(session.last_seen_ms),
+                        busy: sync.busy,
+                        last_synced_revision: sync.last_synced_revision,
+                        server_revision,
+                        studio_changes_since_sync: sync.studio_changes_since_sync,
+                        local_drift,
+                        studio_drift: sync.studio_changes_since_sync > 0,
+                    }
+                }),
             })
             .collect();
         sessions.sort_by(|left, right| {
@@ -869,9 +975,126 @@ fn short_session_id(session_id: &str) -> &str {
     session_id.get(..8).unwrap_or(session_id)
 }
 
+/// Watch the project directory and bump the project revision whenever the
+/// parsed tree changes. Raw events are coalesced for [`WATCH_DEBOUNCE`] and the
+/// rescan runs under the shared fs lock, so it never races an API write.
+///
+/// Uses inotify (via `notify`) and falls back to a 1s polling watcher when
+/// inotify is unavailable (e.g. watch limit reached). The returned handle must
+/// be kept alive; dropping it stops watching.
+fn start_project_watcher(
+    root: PathBuf,
+    revision: ProjectRevision,
+    fs_lock: Arc<tokio::sync::Mutex<()>>,
+) -> Option<Box<dyn std::any::Any + Send>> {
+    use notify::Watcher;
+
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Vec<String>>();
+    let make_handler = || {
+        let sender = sender.clone();
+        let root = root.clone();
+        move |event: notify::Result<notify::Event>| {
+            let Ok(event) = event else {
+                // Errors (e.g. queue overflow) mean we may have missed
+                // something: force a rescan.
+                let _ = sender.send(Vec::new());
+                return;
+            };
+            if matches!(event.kind, notify::EventKind::Access(_)) {
+                return;
+            }
+            if event.paths.is_empty() {
+                let _ = sender.send(Vec::new());
+                return;
+            }
+            let paths: Vec<String> = event
+                .paths
+                .iter()
+                .filter_map(|path| relevant_change_path(&root, path))
+                .collect();
+            if !paths.is_empty() {
+                let _ = sender.send(paths);
+            }
+        }
+    };
+
+    let native = notify::recommended_watcher(make_handler()).and_then(|mut watcher| {
+        watcher.watch(&root, notify::RecursiveMode::Recursive)?;
+        Ok(watcher)
+    });
+    let handle: Option<Box<dyn std::any::Any + Send>> = match native {
+        Ok(watcher) => {
+            revision.set_watcher_kind("notify");
+            Some(Box::new(watcher))
+        }
+        Err(native_error) => {
+            let config = notify::Config::default().with_poll_interval(POLL_WATCH_INTERVAL);
+            match notify::PollWatcher::new(make_handler(), config).and_then(|mut watcher| {
+                watcher.watch(&root, notify::RecursiveMode::Recursive)?;
+                Ok(watcher)
+            }) {
+                Ok(watcher) => {
+                    eprintln!(
+                        "warning: native file watching unavailable ({native_error}); polling every {}ms instead",
+                        POLL_WATCH_INTERVAL.as_millis()
+                    );
+                    revision.set_watcher_kind("poll");
+                    Some(Box::new(watcher))
+                }
+                Err(poll_error) => {
+                    eprintln!(
+                        "warning: file watching disabled ({native_error}; {poll_error}); changes are only noticed on the next push/pull"
+                    );
+                    None
+                }
+            }
+        }
+    };
+    drop(sender);
+
+    tokio::spawn(async move {
+        while let Some(paths) = receiver.recv().await {
+            revision.note_changed_paths(paths);
+            tokio::time::sleep(WATCH_DEBOUNCE).await;
+            while let Ok(more) = receiver.try_recv() {
+                revision.note_changed_paths(more);
+            }
+            let _guard = fs_lock.lock().await;
+            let scan_root = root.clone();
+            let scan_revision = revision.clone();
+            let _ = tokio::task::spawn_blocking(move || {
+                let scan = scan_project(&scan_root);
+                scan_revision.observe_scan(&scan);
+            })
+            .await;
+        }
+    });
+
+    handle
+}
+
 pub async fn serve(root: PathBuf, port: u16) -> Result<()> {
     let host = IpAddr::V4(Ipv4Addr::LOCALHOST);
-    let dashboard = Arc::new(Mutex::new(DashboardState::default()));
+    let revision = ProjectRevision::new();
+    let dashboard = Arc::new(Mutex::new(DashboardState {
+        revision: revision.clone(),
+        ..DashboardState::default()
+    }));
+    let fs_lock = Arc::new(tokio::sync::Mutex::new(()));
+
+    // First scan so revision 1 describes the project as it is right now.
+    {
+        let scan_root = root.clone();
+        let scan = tokio::task::spawn_blocking(move || scan_project(&scan_root))
+            .await
+            .context("initial project scan panicked")?;
+        if let Err(error) = &scan {
+            eprintln!("warning: project does not parse yet: {error:#}");
+        }
+        revision.observe_scan(&scan);
+    }
+    // Keep the watcher alive for as long as the server runs.
+    let _watcher = start_project_watcher(root.clone(), revision.clone(), fs_lock.clone());
     let app = Router::new()
         .route("/", get(dashboard_ui))
         .route("/api/tree", get(get_tree))
@@ -893,6 +1116,7 @@ pub async fn serve(root: PathBuf, port: u16) -> Result<()> {
             "/api/dashboard/select-session",
             post(select_dashboard_session),
         )
+        .route("/api/plugin/sync", post(plugin_sync))
         .route("/api/plugin/heartbeat", post(plugin_heartbeat))
         .route("/api/plugin/poll", post(plugin_poll))
         .route("/api/plugin/command-result", post(plugin_command_result))
@@ -901,7 +1125,8 @@ pub async fn serve(root: PathBuf, port: u16) -> Result<()> {
         .with_state(AppState {
             root: root.clone(),
             dashboard,
-            fs_lock: Arc::new(tokio::sync::Mutex::new(())),
+            fs_lock,
+            revision,
         });
 
     let listener = TcpListener::bind((host, port))
@@ -1021,6 +1246,8 @@ async fn info(State(state): State<AppState>) -> impl IntoResponse {
         "projectRoot": state.root.display().to_string(),
         "capabilities": {
             "guardedPush": true,
+            "heartbeatSync": true,
+            "projectRevision": true,
             "pushAllowDeletes": true,
             "webDashboard": true,
             "studioBridge": true,
@@ -1223,6 +1450,34 @@ async fn plugin_heartbeat(
     }
 }
 
+async fn plugin_sync(
+    State(state): State<AppState>,
+    Json(request): Json<PluginSyncRequest>,
+) -> impl IntoResponse {
+    let project = state.revision.snapshot();
+    match lock_dashboard(&state.dashboard) {
+        Ok(mut dashboard) => {
+            let last_synced = request.last_synced_revision;
+            let studio_changes = request.studio_changes_since_sync;
+            let command = dashboard.update_plugin_sync(request);
+            success(json!({
+                "serverTimeMs": now_ms(),
+                "connectionTimeoutMs": PLUGIN_CONNECTION_TIMEOUT_MS,
+                "drift": {
+                    "local": last_synced.is_some_and(|synced| synced != project.revision),
+                    "studio": studio_changes > 0
+                },
+                "project": project,
+                "command": command
+            }))
+        }
+        Err(_) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            anyhow::anyhow!("dashboard state lock was poisoned"),
+        ),
+    }
+}
+
 async fn plugin_poll(
     State(state): State<AppState>,
     Json(request): Json<PluginPollRequest>,
@@ -1258,8 +1513,15 @@ async fn plugin_command_result(
 }
 
 async fn get_tree(State(state): State<AppState>) -> impl IntoResponse {
-    match with_project_fs(&state, |root| scan_project(&root)).await {
-        Ok(tree) => success(json!({ "tree": tree })),
+    let revision = state.revision.clone();
+    match with_project_fs(&state, move |root| {
+        let scan = scan_project(&root);
+        let revision = revision.observe_scan(&scan);
+        scan.map(|tree| (tree, revision))
+    })
+    .await
+    {
+        Ok((tree, revision)) => success(json!({ "tree": tree, "revision": revision })),
         Err(error) => error_response(StatusCode::INTERNAL_SERVER_ERROR, error),
     }
 }
@@ -1268,8 +1530,12 @@ async fn create_entry(
     State(state): State<AppState>,
     Json(request): Json<CreateRequest>,
 ) -> impl IntoResponse {
+    let revision = state.revision.clone();
     match with_project_fs(&state, move |root| create_entry_impl(&root, request)).await {
-        Ok(tree) => success(json!({ "tree": tree })),
+        Ok(tree) => {
+            let revision = revision.observe_scan(&Ok(tree.clone()));
+            success(json!({ "tree": tree, "revision": revision }))
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -1278,8 +1544,12 @@ async fn update_entry(
     State(state): State<AppState>,
     Json(request): Json<UpdateRequest>,
 ) -> impl IntoResponse {
+    let revision = state.revision.clone();
     match with_project_fs(&state, move |root| update_entry_impl(&root, request)).await {
-        Ok(tree) => success(json!({ "tree": tree })),
+        Ok(tree) => {
+            let revision = revision.observe_scan(&Ok(tree.clone()));
+            success(json!({ "tree": tree, "revision": revision }))
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -1288,8 +1558,12 @@ async fn delete_entry(
     State(state): State<AppState>,
     Json(request): Json<DeleteRequest>,
 ) -> impl IntoResponse {
+    let revision = state.revision.clone();
     match with_project_fs(&state, move |root| delete_entry_impl(&root, request)).await {
-        Ok(tree) => success(json!({ "tree": tree })),
+        Ok(tree) => {
+            let revision = revision.observe_scan(&Ok(tree.clone()));
+            success(json!({ "tree": tree, "revision": revision }))
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -1298,8 +1572,19 @@ async fn sync_from_studio(
     State(state): State<AppState>,
     Json(request): Json<StudioSyncRequest>,
 ) -> impl IntoResponse {
+    let revision = state.revision.clone();
     match with_project_fs(&state, move |root| sync_from_studio_impl(&root, request)).await {
-        Ok(response) => success(json!(response)),
+        Ok(response) => {
+            // After an applied pull, disk matches Studio: record that tree so
+            // the watcher events caused by our own writes are not "drift".
+            let current = match &response.tree {
+                Some(tree) => revision.observe_scan(&Ok(tree.clone())),
+                None => revision.current(),
+            };
+            let mut body = json!(response);
+            body["revision"] = json!(current);
+            success(body)
+        }
         Err(error) => error_response(StatusCode::BAD_REQUEST, error),
     }
 }
@@ -3173,6 +3458,11 @@ mod tests {
         PluginHeartbeatRequest, StudioNode, StudioSyncMode, StudioSyncRequest, UpdateRequest,
         create_entry_impl, sync_from_studio_impl, update_entry_impl,
     };
+    use super::{
+        PLUGIN_CONNECTION_TIMEOUT_MS, PluginSyncRequest, ProjectRevision, now_ms, scan_project,
+        start_project_watcher,
+    };
+    use std::sync::Arc;
 
     fn studio_sync_request(tree: StudioNode) -> StudioSyncRequest {
         StudioSyncRequest {
@@ -4421,6 +4711,128 @@ return 1"#,
         }
         dashboard.prune_sessions();
         assert!(dashboard.active_command.is_none());
+        Ok(())
+    }
+
+    fn sync_request(
+        session: &str,
+        busy: bool,
+        last_synced: Option<u64>,
+        studio: u64,
+    ) -> PluginSyncRequest {
+        PluginSyncRequest {
+            session_id: session.to_string(),
+            bridge_version: Some(super::BRIDGE_PROTOCOL_VERSION.to_string()),
+            place_name: Some("SyncTest".to_string()),
+            place_id: Some(7),
+            status: Some("idle".to_string()),
+            last_synced_revision: last_synced,
+            studio_changes_since_sync: studio,
+            busy,
+        }
+    }
+
+    #[test]
+    fn sync_heartbeat_hands_out_pending_command_in_the_same_reply() -> Result<()> {
+        let mut dashboard = DashboardState::default();
+        assert!(
+            dashboard
+                .update_plugin_sync(sync_request("s", false, None, 0))
+                .is_none()
+        );
+        let queued = dashboard.queue_command(BridgeCommandKind::PushLocalTree, None)?;
+
+        // A busy plugin is not handed a second command...
+        assert!(
+            dashboard
+                .update_plugin_sync(sync_request("s", true, None, 0))
+                .is_none()
+        );
+        assert!(dashboard.pending_command.is_some());
+        // ...the next idle heartbeat gets it straight away (no separate poll).
+        let dispatched = dashboard
+            .update_plugin_sync(sync_request("s", false, None, 0))
+            .expect("command in heartbeat reply");
+        assert_eq!(dispatched.id, queued.id);
+        assert!(dashboard.active_command.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn sync_heartbeat_reports_drift_and_freshness() {
+        let mut dashboard = DashboardState::default();
+        dashboard
+            .revision
+            .observe_scan(&scan_project(tempdir().unwrap().path()));
+        let current = dashboard.revision.current();
+        assert_eq!(current, 1);
+
+        dashboard.update_plugin_sync(sync_request("s", false, Some(current), 0));
+        let sync = dashboard.session_snapshots()[0]
+            .sync
+            .clone()
+            .expect("sync info");
+        assert!(!sync.local_drift && !sync.studio_drift);
+        assert_eq!(sync.server_revision, 1);
+
+        dashboard.update_plugin_sync(sync_request("s", false, Some(0), 2));
+        let snapshot = dashboard.session_snapshots()[0].clone();
+        let sync = snapshot.sync.expect("sync info");
+        assert!(sync.local_drift, "plugin is behind the server revision");
+        assert!(sync.studio_drift);
+        assert_eq!(sync.studio_changes_since_sync, 2);
+        assert!(snapshot.connected);
+
+        // More than 3s without a heartbeat = connection lost.
+        if let Some(session) = dashboard.sessions.get_mut("s") {
+            session.last_seen_ms = now_ms() - PLUGIN_CONNECTION_TIMEOUT_MS - 1;
+        }
+        assert!(!dashboard.session_snapshots()[0].connected);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn file_watcher_bumps_revision_on_real_changes_only() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path().to_path_buf();
+        fs::create_dir_all(root.join("ServerScriptService"))?;
+        fs::write(root.join("ServerScriptService/Main.server.lua"), "print(1)")?;
+        let revision = ProjectRevision::new();
+        revision.observe_scan(&scan_project(&root));
+        let fs_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let watcher = start_project_watcher(root.clone(), revision.clone(), fs_lock);
+        assert!(watcher.is_some());
+        let start = revision.current();
+
+        async fn wait_for(revision: &ProjectRevision, target: u64) -> bool {
+            for _ in 0..60 {
+                if revision.current() >= target {
+                    return true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+            false
+        }
+
+        fs::write(root.join("ServerScriptService/Main.server.lua"), "print(2)")?;
+        assert!(
+            wait_for(&revision, start + 1).await,
+            "edit was not detected"
+        );
+        assert_eq!(revision.current(), start + 1, "one edit = one bump");
+        assert!(
+            revision
+                .snapshot()
+                .recent_changes
+                .contains(&"ServerScriptService/Main.server.lua".to_string())
+        );
+
+        // Hidden/VCS churn and identical rewrites do not move the revision.
+        fs::create_dir_all(root.join(".git"))?;
+        fs::write(root.join(".git/index"), "x")?;
+        fs::write(root.join("ServerScriptService/Main.server.lua"), "print(2)")?;
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        assert_eq!(revision.current(), start + 1);
+        drop(watcher);
         Ok(())
     }
 

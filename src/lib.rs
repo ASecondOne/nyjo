@@ -5,6 +5,7 @@ pub mod init;
 pub mod install;
 pub mod model;
 pub mod parser;
+pub mod revision;
 pub mod server;
 
 pub use backup::{

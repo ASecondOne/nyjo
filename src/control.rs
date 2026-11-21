@@ -82,6 +82,25 @@ pub struct BridgeSessionSnapshot {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<String>,
     pub last_seen_ms: u64,
+    /// Present for plugins that speak the 1s `/api/plugin/sync` heartbeat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sync: Option<SessionSyncSnapshot>,
+}
+
+/// Heartbeat freshness and drift for one Studio session.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionSyncSnapshot {
+    pub heartbeat_age_ms: u64,
+    pub busy: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_synced_revision: Option<u64>,
+    pub server_revision: u64,
+    pub studio_changes_since_sync: u64,
+    /// Local files changed since this session last pushed/pulled.
+    pub local_drift: bool,
+    /// Studio was edited since this session last pushed/pulled.
+    pub studio_drift: bool,
 }
 
 impl BridgeSessionSnapshot {
@@ -447,6 +466,7 @@ mod tests {
                 place_id: Some(101),
                 status: None,
                 last_seen_ms: 1,
+                sync: None,
             },
             BridgeSessionSnapshot {
                 session_id: "session-b".to_string(),
@@ -457,6 +477,7 @@ mod tests {
                 place_id: Some(202),
                 status: None,
                 last_seen_ms: 2,
+                sync: None,
             },
         ]);
 
@@ -484,6 +505,7 @@ mod tests {
                 place_id: Some(101),
                 status: None,
                 last_seen_ms: 1,
+                sync: None,
             },
             BridgeSessionSnapshot {
                 session_id: "session-b".to_string(),
@@ -494,6 +516,7 @@ mod tests {
                 place_id: Some(101),
                 status: None,
                 last_seen_ms: 2,
+                sync: None,
             },
         ]);
 
