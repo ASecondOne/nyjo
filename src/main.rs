@@ -5,8 +5,9 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand, ValueEnum};
 use nyjo::{
     BridgeCommandEnvelope, BridgeCommandKind, BridgeCommandRunReport, BridgeSessionSnapshot,
-    BridgeTargetSelector, NyjoControlClient, init_project, install_plugin,
-    resolve_target_session_id, restore_local_project_backup, scan_project, server, summarize_tree,
+    BridgeTargetSelector, InstallOptions, NyjoControlClient, init_project,
+    install_plugin_with_options, resolve_target_session_id, restore_local_project_backup,
+    scan_project, server, summarize_tree,
 };
 
 #[derive(Debug, Parser)]
@@ -25,11 +26,18 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Package the Studio plugin and install it into TuxBlox (or Vinegar).
     Install {
         #[arg(long, default_value = "dist")]
         output_dir: PathBuf,
-        #[arg(long, default_value_t = 34872)]
+        #[arg(long, default_value_t = 34872, value_parser = clap::value_parser!(u16).range(1..))]
         port: u16,
+        /// Install into this Studio plugins folder instead of auto-discovering one.
+        #[arg(long, conflicts_with = "no_auto_install")]
+        plugins_dir: Option<PathBuf>,
+        /// Only package the plugin into --output-dir.
+        #[arg(long)]
+        no_auto_install: bool,
     },
     Tree {
         #[arg(long, default_value = ".")]
@@ -112,7 +120,19 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Some(Commands::Init { root, force }) => run_init(root, force)?,
-        Some(Commands::Install { output_dir, port }) => run_install(output_dir, port)?,
+        Some(Commands::Install {
+            output_dir,
+            port,
+            plugins_dir,
+            no_auto_install,
+        }) => run_install(
+            output_dir,
+            port,
+            InstallOptions {
+                plugins_dir,
+                no_auto_install,
+            },
+        )?,
         Some(Commands::Tree { root, json }) => print_tree(root, json)?,
         Some(Commands::Serve { root, port }) => {
             let root = canonical_root(root)?;
@@ -211,32 +231,33 @@ fn run_init(root: PathBuf, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn run_install(output_dir: PathBuf, port: u16) -> Result<()> {
-    let report = install_plugin(&output_dir, port)?;
+fn run_install(output_dir: PathBuf, port: u16, options: InstallOptions) -> Result<()> {
+    let no_auto_install = options.no_auto_install;
+    let report = install_plugin_with_options(&output_dir, port, &options)?;
 
     println!(
         "Packaged Nyjo plugin at {}",
         report.packaged_plugin_path.display()
     );
-    if report.installed_paths.is_empty() {
-        if let Some(users_dir) = report.searched_users_dir {
-            println!(
-                "Auto-install skipped: no Vinegar Studio root found under {}",
-                users_dir.display()
-            );
-        } else {
-            println!(
-                "Auto-install skipped: HOME is not set, so Vinegar roots could not be discovered"
-            );
+    if no_auto_install {
+        println!("Auto-install skipped (--no-auto-install).");
+    } else if report.installed_paths.is_empty() {
+        println!("Auto-install skipped: no TuxBlox or Vinegar Studio folder was found. Searched:");
+        for dir in &report.searched_dirs {
+            println!("  - {}", dir.display());
         }
+        println!(
+            "Start Studio once through TuxBlox so it creates its folders, or pass --plugins-dir <dir>."
+        );
     } else {
         println!(
-            "Installed into {} Vinegar plugin folder(s):",
+            "Installed into {} Studio plugin folder(s):",
             report.installed_paths.len()
         );
-        for path in report.installed_paths {
-            println!("  + {}", path.display());
+        for (launcher, path) in &report.installed_paths {
+            println!("  + [{launcher}] {}", path.display());
         }
+        println!("Restart Studio (or reload plugins) to pick up the new plugin.");
     }
 
     Ok(())

@@ -18,6 +18,9 @@ pub use control::{
     SelectBridgeSessionRequest, SelectBridgeSessionResponse, resolve_target_session_id,
 };
 pub use init::{InitReport, init_project};
-pub use install::{InstallReport, install_plugin};
+pub use install::{
+    DiscoveredRoot, InstallOptions, InstallReport, StudioLauncher, install_plugin,
+    install_plugin_with_options,
+};
 pub use model::{InstanceNode, NodeMetadata, TreeSummary, summarize_tree};
 pub use parser::scan_project;
