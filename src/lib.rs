@@ -1,5 +1,6 @@
 pub mod backup;
 pub mod control;
+pub mod fsutil;
 pub mod init;
 pub mod install;
 pub mod model;

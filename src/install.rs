@@ -17,7 +17,6 @@ use std::collections::BTreeSet;
 use std::env;
 use std::fmt;
 use std::fs;
-use std::io::Write;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -171,24 +170,7 @@ fn install_plugin_with_discovery(
 
 /// Write via a temp file + rename so Studio never loads a half-written plugin.
 fn write_atomically(target: &Path, contents: &[u8]) -> Result<()> {
-    let parent = target
-        .parent()
-        .with_context(|| format!("{} has no parent directory", target.display()))?;
-    let file_name = target
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("nyjo");
-    let temp = parent.join(format!(".{file_name}.{}.tmp", std::process::id()));
-    {
-        let mut file = fs::File::create(&temp)
-            .with_context(|| format!("failed to create {}", temp.display()))?;
-        file.write_all(contents)?;
-        file.sync_all()?;
-    }
-    fs::rename(&temp, target).inspect_err(|_| {
-        let _ = fs::remove_file(&temp);
-    })?;
-    Ok(())
+    crate::fsutil::write_atomic(target, contents)
 }
 
 fn normalize_output_dir(output_dir: &Path) -> Result<PathBuf> {
