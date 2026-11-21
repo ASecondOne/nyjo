@@ -408,6 +408,9 @@
           </div>
           <div class="button-row">
             <button id="push-studio">Queue Push To Studio</button>
+            <label title="Off by default. When on, Studio instances that Nyjo created earlier and that no longer exist locally are moved to ServerStorage.NyjoTrash (never destroyed). Pushes that would remove more than 200 instances are refused either way.">
+              <input type="checkbox" id="allow-deletes"> allow deletes
+            </label>
             <button id="preview-pull" class="secondary">Queue Preview Pull</button>
           </div>
           <div class="button-row">
@@ -538,7 +541,11 @@
 
         const meta = document.createElement("div");
         meta.className = "log-meta";
-        meta.innerHTML = `<span>${entry.level || "info"}</span><span>${formatClock(entry.timestampMs)}</span>`;
+        const levelSpan = document.createElement("span");
+        levelSpan.textContent = entry.level || "info";
+        const clockSpan = document.createElement("span");
+        clockSpan.textContent = formatClock(entry.timestampMs);
+        meta.replaceChildren(levelSpan, clockSpan);
 
         const body = document.createElement("div");
         body.textContent = entry.message || "(empty log)";
@@ -709,10 +716,10 @@
       setToast("Local tree preview updated.");
     }
 
-    async function queueStudioCommand(kind, label) {
+    async function queueStudioCommand(kind, label, extra) {
       const data = await api("/api/dashboard/command", {
         method: "POST",
-        body: JSON.stringify({ kind }),
+        body: JSON.stringify({ kind, ...(extra || {}) }),
       });
       setToast(data.message || `Queued ${label}.`);
       await refreshDashboard();
@@ -733,7 +740,13 @@
     });
 
     document.getElementById("push-studio").addEventListener("click", () => {
-      queueStudioCommand("pushLocalTree", "push to Studio").catch((error) => {
+      const allowDeletesBox = document.getElementById("allow-deletes");
+      const allowDeletes = allowDeletesBox.checked;
+      if (allowDeletes && !window.confirm("Push with deletes allowed? Instances removed locally will be moved to ServerStorage.NyjoTrash.")) {
+        return;
+      }
+      allowDeletesBox.checked = false;
+      queueStudioCommand("pushLocalTree", "push to Studio", { allowDeletes }).catch((error) => {
         setToast(error.message);
       });
     });

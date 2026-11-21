@@ -1,7 +1,12 @@
+-- Nyjo Studio bridge plugin (installed by `nyjo install`).
+-- Talks only to the local nyjo server on 127.0.0.1.
 local ChangeHistoryService = game:GetService("ChangeHistoryService")
 local CollectionService = game:GetService("CollectionService")
 local HttpService = game:GetService("HttpService")
 local MarketplaceService = game:GetService("MarketplaceService")
+local RunService = game:GetService("RunService")
+local ScriptEditorService = game:GetService("ScriptEditorService")
+local ServerStorage = game:GetService("ServerStorage")
 
 local TOOLBAR_ID = "NyjoToolbar"
 local BUTTON_ID = "NyjoToggle"
@@ -11,7 +16,22 @@ local SETTINGS_KEY_LAST_STUDIO_BACKUP_ID = "nyjo_last_studio_backup_id"
 local SETTINGS_KEY_LAST_STUDIO_BACKUP_PLACE_ID = "nyjo_last_studio_backup_place_id"
 local SETTINGS_KEY_LAST_STUDIO_BACKUP_LABEL = "nyjo_last_studio_backup_label"
 local DEFAULT_PORT = {{DEFAULT_PORT}}
-local BRIDGE_VERSION = "nyjo-studio-bridge/1"
+local BRIDGE_VERSION = "nyjo-studio-bridge/2"
+-- Even with deletes allowed, refuse a push that would remove more than this
+-- many instances (counting descendants). Protects against a broken or
+-- half-empty local tree wiping the place.
+local MAX_PUSH_DELETED_INSTANCES = 200
+local TRASH_FOLDER_NAME = "NyjoTrash"
+local POLL_INTERVAL_SECONDS = 1
+local MAX_POLL_BACKOFF_SECONDS = 15
+-- Properties Nyjo never writes from local data: identity is name + class and
+-- the tree structure, not a property map.
+local PROTECTED_PROPERTIES = {
+	Name = true,
+	Parent = true,
+	ClassName = true,
+	Archivable = true,
+}
 local BRIDGE_SESSION_ID = HttpService:GenerateGUID(false)
 local MANAGED_ATTRIBUTE = "NyjoManagedBy"
 local MANAGED_CHILD_KEYS_ATTRIBUTE = "NyjoManagedChildKeys"
@@ -93,6 +113,7 @@ local GUI_OBJECT_PROPERTIES = {
 }
 local TEXT_PROPERTIES = {
 	"Font",
+	"FontFace",
 	"LineHeight",
 	"RichText",
 	"Text",
@@ -169,7 +190,19 @@ local widgetInfo = DockWidgetPluginGuiInfo.new(
 	240
 )
 
-local widget = plugin:CreateDockWidgetPluginGui(WIDGET_ID, widgetInfo)
+-- CreateDockWidgetPluginGui is deprecated in favour of the Async variant;
+-- fall back for older Studio builds.
+local widget
+do
+	local ok, created = pcall(function()
+		return plugin:CreateDockWidgetPluginGuiAsync(WIDGET_ID, widgetInfo)
+	end)
+	if ok and created then
+		widget = created
+	else
+		widget = plugin:CreateDockWidgetPluginGui(WIDGET_ID, widgetInfo)
+	end
+end
 widget.Title = "Nyjo"
 
 local root = Instance.new("Frame")
@@ -411,7 +444,7 @@ local function dashboardUrl()
 	return ("http://127.0.0.1:%d/"):format(readPort())
 end
 
-setStatus("Nyjo Studio bridge ready.\n\nUse the web dashboard at " .. dashboardUrl() .. " to inspect logs, queue Studio work, and review pull plans.\n\nPush now saves a Studio backup first, and Restore Studio Backup can roll the place tree back if a sync goes sideways.")
+setStatus("Nyjo Studio bridge ready.\n\nUse the web dashboard at " .. dashboardUrl() .. " to inspect logs, queue Studio work, and review pull plans.\n\nSafety: a push saves a Studio backup first, is one Ctrl+Z step, rolls itself back on error, and never removes anything unless deletes are explicitly allowed (removed instances go to ServerStorage.NyjoTrash).")
 
 local function request(path, method, body)
 	local port = savePort()
@@ -606,8 +639,24 @@ end
 
 local function encodeTypedValue(value)
 	local valueType = typeof(value)
-	if valueType == "boolean" or valueType == "number" or valueType == "string" then
+	if valueType == "number" then
+		-- JSON cannot carry NaN/inf; dropping the value beats failing the snapshot.
+		if value ~= value or value == math.huge or value == -math.huge then
+			return nil
+		end
 		return value
+	end
+	if valueType == "boolean" or valueType == "string" then
+		return value
+	end
+
+	if valueType == "Font" then
+		return {
+			__nyjoType = "Font",
+			family = value.Family,
+			weight = value.Weight.Name,
+			style = value.Style.Name,
+		}
 	end
 
 	if valueType == "Color3" then
@@ -686,6 +735,20 @@ local function decodeTypedValue(value)
 	end
 
 	local marker = value.__nyjoType
+	if marker == "Font" then
+		if typeof(value.family) ~= "string" then
+			return nil
+		end
+		local ok, font = pcall(function()
+			return Font.new(
+				value.family,
+				Enum.FontWeight[value.weight or "Regular"],
+				Enum.FontStyle[value.style or "Normal"]
+			)
+		end)
+		return ok and font or nil
+	end
+
 	if marker == "Color3" then
 		return Color3.new(tonumber(value.r) or 0, tonumber(value.g) or 0, tonumber(value.b) or 0)
 	end
@@ -929,11 +992,17 @@ local function sanitizeSnapshotAttributes(attributes)
 end
 
 local function snapshotStudioNode(instance)
+	local properties = extractStudioProperties(instance)
+	if properties.FontFace ~= nil then
+		-- Font (Enum) is the legacy view of FontFace and reads as Unknown for
+		-- custom fonts; FontFace is authoritative.
+		properties.Font = nil
+	end
 	local node = {
 		name = instance.Name,
 		className = instance.ClassName,
 		children = {},
-		properties = normalizeDictionary(extractStudioProperties(instance)),
+		properties = normalizeDictionary(properties),
 		attributes = sanitizeSnapshotAttributes(instance:GetAttributes()),
 		tags = normalizeTags(CollectionService:GetTags(instance)),
 	}
@@ -948,7 +1017,10 @@ local function snapshotStudioNode(instance)
 	end
 
 	for _, child in ipairs(instance:GetChildren()) do
-		table.insert(node.children, snapshotStudioNode(child))
+		local isTrash = instance == ServerStorage and child.Name == TRASH_FOLDER_NAME
+		if not isTrash then
+			table.insert(node.children, snapshotStudioNode(child))
+		end
 	end
 
 	return node
@@ -990,18 +1062,18 @@ end
 
 local function summarizeCounters(counters)
 	return string.format(
-		"created=%d\nupdated=%d\ndeleted=%d\nskipped=%d",
+		"created=%d\nupdated=%d\ndeleted (moved to trash)=%d\nleft in Studio (deletes off)=%d\nskipped=%d",
 		counters.created,
 		counters.updated,
 		counters.deleted,
+		counters.keptDeletes or 0,
 		counters.skipped
 	)
 end
 
 local function safeSetProperty(instance, propertyName, value)
-	if propertyName == "Name" then
-		instance.Name = tostring(value)
-		return true
+	if typeof(propertyName) ~= "string" or PROTECTED_PROPERTIES[propertyName] then
+		return false
 	end
 
 	local decoded = decodeTypedValue(value)
@@ -1091,29 +1163,17 @@ local function applyProperties(instance, node)
 				end
 			end
 		else
+			local hasFontFace = node.properties.FontFace ~= nil
 			for propertyName, value in pairs(node.properties) do
-				safeSetProperty(instance, propertyName, value)
+				if not (hasFontFace and propertyName == "Font") then
+					safeSetProperty(instance, propertyName, value)
+				end
 			end
 		end
 	end
 
-	if typeof(node.source) == "string" then
-		pcall(function()
-			instance.Source = node.source
-		end)
-	end
-
 	applyAttributes(instance, node.attributes)
 	applyTags(instance, node.tags)
-end
-
-local function findExactChild(parent, node)
-	for _, child in ipairs(parent:GetChildren()) do
-		if child.Name == node.name and child.ClassName == node.className then
-			return child
-		end
-	end
-	return nil
 end
 
 local function markManaged(instance)
@@ -1180,128 +1240,6 @@ local function readStudioBackupMarker()
 	}
 end
 
-local function writeManagedChildKeys(parent, desiredChildren)
-	local keys = {}
-	if typeof(desiredChildren) == "table" then
-		for _, node in ipairs(desiredChildren) do
-			table.insert(keys, nodeKey(node.name, node.className))
-		end
-	end
-
-	table.sort(keys)
-
-	local ok, encoded = pcall(function()
-		return HttpService:JSONEncode(keys)
-	end)
-	if not ok then
-		return
-	end
-
-	pcall(function()
-		parent:SetAttribute(MANAGED_CHILD_KEYS_ATTRIBUTE, encoded)
-	end)
-end
-
-local function buildDesiredMap(children)
-	local desiredByKey = {}
-	local desiredKeys = {}
-
-	if typeof(children) ~= "table" then
-		return desiredByKey, desiredKeys
-	end
-
-	for _, node in ipairs(children) do
-		local key = nodeKey(node.name, node.className)
-		desiredByKey[key] = node
-		desiredKeys[key] = true
-	end
-
-	return desiredByKey, desiredKeys
-end
-
-local syncChildren
-
-local function resolveOrCreateChild(parent, node, counters)
-	local exact = findExactChild(parent, node)
-	if exact then
-		-- Exact name/class matches can be adopted incrementally. Only matched
-		-- nodes become managed, so unrelated Studio content stays untouched.
-		if not isManaged(exact) then
-			markManaged(exact)
-		end
-		return exact, false
-	end
-
-	local unsafeReason = UNSAFE_CREATE_CLASS_REASONS[node.className]
-	if typeof(unsafeReason) == "string" and unsafeReason ~= "" then
-		counters.skipped = counters.skipped + 1
-		return nil, string.format(
-			"Nyjo refused to create %s %s: %s",
-			tostring(node.className),
-			tostring(node.name),
-			unsafeReason
-		)
-	end
-
-	local instance
-	local ok, createError = pcall(function()
-		instance = Instance.new(node.className)
-	end)
-	if not ok or instance == nil then
-		counters.skipped = counters.skipped + 1
-		return nil, "cannot create class " .. tostring(node.className) .. " for " .. tostring(node.name) .. ": " .. tostring(createError)
-	end
-
-	instance.Name = node.name
-	markManaged(instance)
-	instance.Parent = parent
-	counters.created = counters.created + 1
-	return instance, true
-end
-
-syncChildren = function(parent, desiredChildren, counters, warnings)
-	local desiredByKey, desiredKeys = buildDesiredMap(desiredChildren)
-	local previousManagedKeys = readManagedChildKeys(parent)
-
-	for key, node in pairs(desiredByKey) do
-		local instance, createdOrError, maybeError = resolveOrCreateChild(parent, node, counters)
-		local created = false
-		if typeof(createdOrError) == "boolean" then
-			created = createdOrError
-		else
-			maybeError = createdOrError
-		end
-
-		if not instance then
-			if maybeError then
-				table.insert(warnings, maybeError)
-			end
-		else
-			applyProperties(instance, node)
-			if not created then
-				counters.updated = counters.updated + 1
-			end
-
-			syncChildren(instance, node.children, counters, warnings)
-		end
-	end
-
-	-- Only delete child keys that Nyjo itself synced on an earlier push. This
-	-- preserves manual Studio duplicates/build-outs that may inherit Nyjo's
-	-- managed marker from cloned instances.
-	for _, child in ipairs(parent:GetChildren()) do
-		if isManaged(child) then
-			local key = nodeKey(child.Name, child.ClassName)
-			if previousManagedKeys[key] and not desiredKeys[key] then
-				child:Destroy()
-				counters.deleted = counters.deleted + 1
-			end
-		end
-	end
-
-	writeManagedChildKeys(parent, desiredChildren)
-end
-
 local function resolveService(node)
 	if ROOT_SERVICE_CLASSES[node.className] ~= true then
 		return nil, "top-level node " .. tostring(node.name) .. " is not a supported service class"
@@ -1316,6 +1254,336 @@ local function resolveService(node)
 	end
 
 	return service
+end
+
+-- Defined further down (needs the bridge state); declared here because the
+-- backup helpers call it. Calling it before this forward declaration existed
+-- made every push fail with "attempt to call a nil value".
+local resolveBridgePlaceName
+
+local function writeManagedChildKeys(parent, keySet)
+	local keys = {}
+	for key, _ in pairs(keySet) do
+		table.insert(keys, key)
+	end
+	table.sort(keys)
+
+	local ok, encoded = pcall(function()
+		return HttpService:JSONEncode(keys)
+	end)
+	if not ok then
+		return
+	end
+
+	pcall(function()
+		parent:SetAttribute(MANAGED_CHILD_KEYS_ATTRIBUTE, encoded)
+	end)
+end
+
+local function describePath(parentPath, name)
+	if parentPath == nil or parentPath == "" then
+		return tostring(name)
+	end
+	return parentPath .. "." .. tostring(name)
+end
+
+-- Validates one node coming from the server (local files or a backup) and
+-- returns an error string for anything Nyjo must not try to apply.
+local function invalidNodeReason(node)
+	if typeof(node) ~= "table" then
+		return "node is not an object"
+	end
+	if typeof(node.name) ~= "string" or node.name == "" then
+		return "node has no name"
+	end
+	if #node.name > 100 then
+		return "name is longer than Roblox allows (100 characters)"
+	end
+	if typeof(node.className) ~= "string" or node.className == "" then
+		return "node has no className"
+	end
+	if node.children ~= nil and typeof(node.children) ~= "table" then
+		return "children is not a list"
+	end
+	return nil
+end
+
+local function countTreeNodes(node)
+	local total = 1
+	if typeof(node) == "table" and typeof(node.children) == "table" then
+		for _, child in ipairs(node.children) do
+			total = total + countTreeNodes(child)
+		end
+	end
+	return total
+end
+
+-- Returns desiredByKey (first node per key wins), the ordered key list, and
+-- pushes a warning for duplicate or invalid nodes.
+local function buildDesiredMap(children, parentPath, warnings)
+	local desiredByKey = {}
+	local orderedKeys = {}
+
+	if typeof(children) ~= "table" then
+		return desiredByKey, orderedKeys
+	end
+
+	for _, node in ipairs(children) do
+		local reason = invalidNodeReason(node)
+		if reason then
+			table.insert(warnings, string.format("skipped invalid node under %s: %s", tostring(parentPath), reason))
+		else
+			local key = nodeKey(node.name, node.className)
+			if desiredByKey[key] then
+				table.insert(
+					warnings,
+					string.format(
+						"%s has more than one local %s named %q; only the first one is synced (use unique names)",
+						tostring(parentPath),
+						node.className,
+						node.name
+					)
+				)
+			else
+				desiredByKey[key] = node
+				table.insert(orderedKeys, key)
+			end
+		end
+	end
+
+	return desiredByKey, orderedKeys
+end
+
+local function findMatchingChildren(parent, node)
+	local matches = {}
+	for _, child in ipairs(parent:GetChildren()) do
+		if child.Name == node.name and child.ClassName == node.className then
+			table.insert(matches, child)
+		end
+	end
+	return matches
+end
+
+-- Phase 1: work out what a push would do without touching Studio.
+local function planChildren(parent, desiredChildren, parentPath, plan)
+	local desiredByKey, orderedKeys = buildDesiredMap(desiredChildren, parentPath, plan.warnings)
+	local previousManagedKeys = readManagedChildKeys(parent)
+
+	for _, key in ipairs(orderedKeys) do
+		local node = desiredByKey[key]
+		local path = describePath(parentPath, node.name)
+		local matches = findMatchingChildren(parent, node)
+		if #matches > 1 then
+			table.insert(
+				plan.warnings,
+				string.format(
+					"%s: %d Studio instances share this name and class; only the first one is updated",
+					path,
+					#matches
+				)
+			)
+		end
+
+		if matches[1] then
+			plan.updates = plan.updates + 1
+			planChildren(matches[1], node.children, path, plan)
+		else
+			local unsafeReason = UNSAFE_CREATE_CLASS_REASONS[node.className]
+			if unsafeReason then
+				plan.skipped = plan.skipped + 1
+				table.insert(plan.warnings, string.format("%s: will not create %s (%s)", path, node.className, unsafeReason))
+			else
+				plan.creates = plan.creates + countTreeNodes(node)
+			end
+		end
+	end
+
+	-- Deletion candidates: only instances Nyjo itself synced into this parent
+	-- on an earlier push (marked managed AND listed in the parent's managed
+	-- key list) whose key is gone from the local tree.
+	for _, child in ipairs(parent:GetChildren()) do
+		if isManaged(child) then
+			local key = nodeKey(child.Name, child.ClassName)
+			if previousManagedKeys[key] and desiredByKey[key] == nil then
+				table.insert(plan.deletes, {
+					instance = child,
+					path = describePath(parentPath, child.Name),
+					descendants = #child:GetDescendants(),
+				})
+				plan.deletedInstances = plan.deletedInstances + 1 + #child:GetDescendants()
+			end
+		end
+	end
+end
+
+local function planPush(tree)
+	local plan = {
+		creates = 0,
+		updates = 0,
+		skipped = 0,
+		deletes = {},
+		deletedInstances = 0,
+		warnings = {},
+		services = {},
+	}
+
+	for _, serviceNode in ipairs(tree.children or {}) do
+		local reason = invalidNodeReason(serviceNode)
+		if reason then
+			plan.skipped = plan.skipped + 1
+			table.insert(plan.warnings, "skipped invalid top-level node: " .. reason)
+		else
+			local service, errorMessage = resolveService(serviceNode)
+			if service then
+				table.insert(plan.services, { service = service, node = serviceNode })
+				planChildren(service, serviceNode.children, serviceNode.name, plan)
+			else
+				plan.skipped = plan.skipped + 1
+				table.insert(plan.warnings, errorMessage)
+			end
+		end
+	end
+
+	return plan
+end
+
+local function getTrashFolder(batchLabel)
+	local trash = ServerStorage:FindFirstChild(TRASH_FOLDER_NAME)
+	if trash == nil or not trash:IsA("Folder") then
+		trash = Instance.new("Folder")
+		trash.Name = TRASH_FOLDER_NAME
+		trash:SetAttribute("NyjoNote", "Instances removed by Nyjo pushes. Safe to delete once you are sure you do not need them.")
+		trash.Parent = ServerStorage
+	end
+
+	local batch = trash:FindFirstChild(batchLabel)
+	if batch == nil then
+		batch = Instance.new("Folder")
+		batch.Name = batchLabel
+		batch.Parent = trash
+	end
+	return batch
+end
+
+-- Soft delete: move into ServerStorage.NyjoTrash/<batch> (scripts stop
+-- running there) instead of Destroy(), so nothing is ever unrecoverable.
+local function trashInstance(instance, originalPath, batchLabel)
+	local batch = getTrashFolder(batchLabel)
+	instance:SetAttribute("NyjoOriginalPath", originalPath)
+	instance:SetAttribute(MANAGED_ATTRIBUTE, nil)
+	instance.Parent = batch
+end
+
+local function setScriptSource(instance, source, path, warnings)
+	local okRead, current = pcall(function()
+		return instance.Source
+	end)
+	if okRead and current == source then
+		return
+	end
+
+	local ok, setError = pcall(function()
+		instance.Source = source
+	end)
+	if ok then
+		return
+	end
+
+	-- Collaborative editing / open drafts can reject direct Source writes;
+	-- ScriptEditorService is the supported path for those.
+	local okAsync, asyncError = pcall(function()
+		ScriptEditorService:UpdateSourceAsync(instance, function()
+			return source
+		end)
+	end)
+	if not okAsync then
+		table.insert(
+			warnings,
+			string.format("%s: could not update script source (%s / %s)", path, tostring(setError), tostring(asyncError))
+		)
+	end
+end
+
+local function applyNode(instance, node, path, context)
+	applyProperties(instance, node)
+	if typeof(node.source) == "string" and instance:IsA("LuaSourceContainer") then
+		setScriptSource(instance, node.source, path, context.warnings)
+	end
+end
+
+local applyChildren
+
+local function createInstanceTree(parent, node, path, context)
+	local unsafeReason = UNSAFE_CREATE_CLASS_REASONS[node.className]
+	if unsafeReason then
+		context.counters.skipped = context.counters.skipped + 1
+		return
+	end
+
+	local instance
+	local ok, createError = pcall(function()
+		instance = Instance.new(node.className)
+	end)
+	if not ok or instance == nil then
+		context.counters.skipped = context.counters.skipped + 1
+		table.insert(context.warnings, string.format("%s: cannot create class %s (%s)", path, tostring(node.className), tostring(createError)))
+		return
+	end
+
+	instance.Name = node.name
+	markManaged(instance)
+	-- Configure before parenting so scripts never run with stale contents.
+	applyNode(instance, node, path, context)
+	applyChildren(instance, node.children, path, context)
+	instance.Parent = parent
+	context.counters.created = context.counters.created + 1
+end
+
+applyChildren = function(parent, desiredChildren, parentPath, context)
+	local desiredByKey, orderedKeys = buildDesiredMap(desiredChildren, parentPath, {})
+	local previousManagedKeys = readManagedChildKeys(parent)
+	local managedKeysAfter = {}
+
+	for _, key in ipairs(orderedKeys) do
+		local node = desiredByKey[key]
+		local path = describePath(parentPath, node.name)
+		local existing = findMatchingChildren(parent, node)[1]
+		if existing then
+			if not isManaged(existing) then
+				-- Adopt exact name/class matches; unrelated Studio content
+				-- stays unmanaged and is never deleted by Nyjo.
+				markManaged(existing)
+			end
+			applyNode(existing, node, path, context)
+			applyChildren(existing, node.children, path, context)
+			context.counters.updated = context.counters.updated + 1
+			managedKeysAfter[key] = true
+		elseif UNSAFE_CREATE_CLASS_REASONS[node.className] == nil then
+			createInstanceTree(parent, node, path, context)
+			managedKeysAfter[key] = true
+		else
+			context.counters.skipped = context.counters.skipped + 1
+		end
+	end
+
+	for _, child in ipairs(parent:GetChildren()) do
+		if isManaged(child) then
+			local key = nodeKey(child.Name, child.ClassName)
+			if previousManagedKeys[key] and desiredByKey[key] == nil then
+				if context.allowDeletes then
+					trashInstance(child, describePath(parentPath, child.Name), context.trashBatch)
+					context.counters.deleted = context.counters.deleted + 1
+				else
+					-- Keep tracking it so a later --allow-deletes push can
+					-- still clean it up.
+					managedKeysAfter[key] = true
+					context.counters.keptDeletes = context.counters.keptDeletes + 1
+				end
+			end
+		end
+	end
+
+	writeManagedChildKeys(parent, managedKeysAfter)
 end
 
 local function buildPushMessage(headline, counters, warnings, notes)
@@ -1334,57 +1602,124 @@ local function buildPushMessage(headline, counters, warnings, notes)
 	end
 
 	if #warnings > 0 then
-		message = message .. "\n\nWarnings:\n- " .. table.concat(warnings, "\n- ")
+		local shown = {}
+		for index = 1, math.min(#warnings, 25) do
+			table.insert(shown, warnings[index])
+		end
+		message = message .. "\n\nWarnings:\n- " .. table.concat(shown, "\n- ")
+		if #warnings > #shown then
+			message = message .. string.format("\n- ... and %d more", #warnings - #shown)
+		end
 	end
 
 	return message
 end
 
+local function formatDeleteList(deletes, limit)
+	local lines = {}
+	for index, entry in ipairs(deletes) do
+		if index > limit then
+			table.insert(lines, string.format("... and %d more", #deletes - limit))
+			break
+		end
+		if entry.descendants > 0 then
+			table.insert(lines, string.format("%s (+%d descendants)", entry.path, entry.descendants))
+		else
+			table.insert(lines, entry.path)
+		end
+	end
+	return table.concat(lines, "\n")
+end
+
 local function pushTree(tree, updateStatus, options)
-	if typeof(tree) ~= "table" then
+	if typeof(tree) ~= "table" or typeof(tree.children) ~= "table" then
 		error("server response did not contain a tree")
+	end
+	options = typeof(options) == "table" and options or {}
+
+	if RunService:IsRunning() then
+		error("Studio is in a playtest; stop the playtest before pushing (changes made during play are discarded)")
+	end
+
+	local allowDeletes = options.allowDeletes == true
+	local plan = planPush(tree)
+
+	if allowDeletes and plan.deletedInstances > MAX_PUSH_DELETED_INSTANCES then
+		error(string.format(
+			"Push refused: it would remove %d instances (limit %d). Nothing was changed.\n\nWould remove:\n%s\n\nIf this is intended, delete them in Studio by hand, or push in smaller steps.",
+			plan.deletedInstances,
+			MAX_PUSH_DELETED_INSTANCES,
+			formatDeleteList(plan.deletes, 20)
+		))
 	end
 
 	local counters = {
 		created = 0,
 		updated = 0,
 		deleted = 0,
-		skipped = 0,
+		keptDeletes = 0,
+		skipped = plan.skipped,
 	}
-	local warnings = {}
+	local warnings = plan.warnings
+	local context = {
+		counters = counters,
+		warnings = warnings,
+		allowDeletes = allowDeletes,
+		trashBatch = DateTime.now():FormatUniversalTime("YYYYMMDD[T]HHmmss[Z]", "en-us") .. "-" .. string.sub(HttpService:GenerateGUID(false), 1, 8),
+	}
 
-	ChangeHistoryService:SetWaypoint("Nyjo Push Start")
-	for _, serviceNode in ipairs(tree.children or {}) do
-		local service, errorMessage = resolveService(serviceNode)
-		if service then
-			syncChildren(service, serviceNode.children, counters, warnings)
-		else
-			counters.skipped = counters.skipped + 1
-			table.insert(warnings, errorMessage)
-		end
+	local recording = ChangeHistoryService:TryBeginRecording("Nyjo Push")
+	if recording == nil then
+		error("Studio refused to start an undo recording (another plugin may be recording); nothing was changed")
 	end
-	ChangeHistoryService:SetWaypoint("Nyjo Push End")
+
+	local ok, applyError = xpcall(function()
+		for _, entry in ipairs(plan.services) do
+			applyChildren(entry.service, entry.node.children, entry.node.name, context)
+		end
+	end, debug.traceback)
+
+	if not ok then
+		-- Cancel reverts everything captured since TryBeginRecording.
+		ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Cancel)
+		error("Push failed and was rolled back; Studio is unchanged.\n\n" .. tostring(applyError))
+	end
+	ChangeHistoryService:FinishRecording(recording, Enum.FinishRecordingOperation.Commit)
 
 	local notes = {}
-	if typeof(options) == "table" then
-		local backup = options.backup
-		if typeof(backup) == "table" then
-			table.insert(notes, "Studio backup saved: " .. tostring(backup.label or backup.id or "unknown"))
-		end
+	if counters.keptDeletes > 0 then
+		table.insert(
+			notes,
+			string.format(
+				"%d instance(s) no longer exist locally but were LEFT in Studio (deletes are off by default):\n%s\nPush with allowDeletes (CLI: nyjo push --allow-deletes) to move them to ServerStorage.%s.",
+				counters.keptDeletes,
+				formatDeleteList(plan.deletes, 10),
+				TRASH_FOLDER_NAME
+			)
+		)
+	end
+	if counters.deleted > 0 then
+		table.insert(notes, string.format("Removed instances were moved to ServerStorage.%s.%s", TRASH_FOLDER_NAME, context.trashBatch))
+	end
+	table.insert(notes, "Undo with Ctrl+Z (one step: \"Nyjo Push\").")
 
-		local restoredBackup = options.restoredBackup
-		if typeof(restoredBackup) == "table" then
-			table.insert(notes, "Restored Studio from: " .. tostring(restoredBackup.label or restoredBackup.id or "unknown"))
-		end
+	local backup = options.backup
+	if typeof(backup) == "table" then
+		table.insert(notes, "Studio backup saved: " .. tostring(backup.label or backup.id or "unknown"))
+	end
 
-		local rescueBackup = options.rescueBackup
-		if typeof(rescueBackup) == "table" then
-			table.insert(notes, "Current Studio state rescued as: " .. tostring(rescueBackup.label or rescueBackup.id or "unknown"))
-		end
+	local restoredBackup = options.restoredBackup
+	if typeof(restoredBackup) == "table" then
+		table.insert(notes, "Restored Studio from: " .. tostring(restoredBackup.label or restoredBackup.id or "unknown"))
+	end
+
+	local rescueBackup = options.rescueBackup
+	if typeof(rescueBackup) == "table" then
+		table.insert(notes, "Current Studio state rescued as: " .. tostring(rescueBackup.label or rescueBackup.id or "unknown"))
 	end
 
 	local headline = "Push complete."
-	if typeof(options) == "table" and typeof(options.headline) == "string" and options.headline ~= "" then
+	if typeof(options.headline) == "string" and options.headline ~= "" then
 		headline = options.headline
 	end
 
@@ -1419,17 +1754,53 @@ local function createStudioBackup(reason, tree, remember)
 	return backup
 end
 
-local function pushLocalTree(updateStatus)
-	local studioTree = captureStudioTree()
-	local backup = createStudioBackup("before push local tree", studioTree, true)
+local operationInProgress = nil
+
+-- Only one push/pull/restore at a time, whether it came from a button or
+-- from the dashboard/CLI bridge.
+local function runExclusive(label, fn, ...)
+	if operationInProgress ~= nil then
+		error(string.format("Nyjo is busy (%s); try again when it finishes", operationInProgress), 0)
+	end
+	operationInProgress = label
+	local results = table.pack(pcall(fn, ...))
+	operationInProgress = nil
+	if not results[1] then
+		error(results[2], 0)
+	end
+	return table.unpack(results, 2, results.n)
+end
+
+local function ensureCompatibleServer()
+	local decoded = fetchJson("/api/health")
+	local protocol = decoded and decoded.data and decoded.data.bridgeProtocol
+	if protocol ~= BRIDGE_VERSION then
+		error(string.format(
+			"nyjo server speaks %s but this plugin speaks %s. Rebuild nyjo, run `nyjo install`, and restart Studio.",
+			tostring(protocol or "an older protocol"),
+			BRIDGE_VERSION
+		), 0)
+	end
+end
+
+local function pushLocalTree(updateStatus, allowDeletes)
+	ensureCompatibleServer()
+	-- Fetch and validate the local tree before touching anything, so a parse
+	-- error on disk can never turn into a destructive push.
 	local decoded = fetchJson("/api/tree")
 	local tree = decoded and decoded.data and decoded.data.tree
+	if typeof(tree) ~= "table" or typeof(tree.children) ~= "table" then
+		error("server response did not contain a tree; nothing was changed", 0)
+	end
+	local backup = createStudioBackup("before push local tree", captureStudioTree(), true)
 	return pushTree(tree, updateStatus, {
 		backup = backup,
+		allowDeletes = allowDeletes == true,
 	})
 end
 
 local function restoreStudioBackup(updateStatus)
+	ensureCompatibleServer()
 	local savedBackup = readStudioBackupMarker()
 	if savedBackup == nil then
 		error("no saved Studio backup is available yet; push to Studio once first")
@@ -1457,6 +1828,10 @@ local function restoreStudioBackup(updateStatus)
 end
 
 local function syncFromStudio(mode, force, updateStatus)
+	ensureCompatibleServer()
+	if RunService:IsRunning() then
+		error("Studio is in a playtest; stop it before pulling so play-mode state is not written to disk", 0)
+	end
 	local tree = captureStudioTree()
 	local response = postJson("/api/sync-from-studio", {
 		tree = tree,
@@ -1552,7 +1927,7 @@ local placeInfoCache = {
 	lastAttempt = 0,
 }
 
-local function resolveBridgePlaceName()
+resolveBridgePlaceName = function()
 	local placeId = game.PlaceId
 	local fallbackName = game.Name
 	if placeId == 0 then
@@ -1569,7 +1944,7 @@ local function resolveBridgePlaceName()
 		return placeInfoCache.resolvedName
 	end
 
-	local now = tick()
+	local now = os.clock()
 	if now - placeInfoCache.lastAttempt < 30 then
 		return fallbackName
 	end
@@ -1621,7 +1996,7 @@ end
 local function executeBridgeCommand(command)
 	local kind = command and command.kind
 	if kind == "pushLocalTree" then
-		local result = pushLocalTree(true)
+		local result = runExclusive("push", pushLocalTree, true, command.allowDeletes == true)
 		return true, "Push complete", result.message, {
 			counters = result.counters,
 			warnings = result.warnings,
@@ -1629,17 +2004,17 @@ local function executeBridgeCommand(command)
 	end
 
 	if kind == "previewPull" then
-		local result = syncFromStudio("preview", false, true)
+		local result = runExclusive("preview pull", syncFromStudio, "preview", false, true)
 		return true, "Preview Pull ready", result.message, result.response
 	end
 
 	if kind == "applyPull" then
-		local result = syncFromStudio("apply", false, true)
+		local result = runExclusive("apply pull", syncFromStudio, "apply", false, true)
 		return true, "Apply Pull complete", result.message, result.response
 	end
 
 	if kind == "forcePull" then
-		local result = syncFromStudio("apply", true, true)
+		local result = runExclusive("force pull", syncFromStudio, "apply", true, true)
 		return true, "Force Pull complete", result.message, result.response
 	end
 
@@ -1650,7 +2025,7 @@ local function bridgePollOnce()
 	local heartbeatOk, heartbeatResult = reportBridgeHeartbeat()
 	if not heartbeatOk then
 		bridgeState.lastError = tostring(heartbeatResult)
-		return
+		return false
 	end
 
 	local ok, pollResponse = pcall(function()
@@ -1660,13 +2035,13 @@ local function bridgePollOnce()
 	end)
 	if not ok then
 		bridgeState.lastError = tostring(pollResponse)
-		return
+		return false
 	end
 
 	bridgeState.lastError = nil
 	local command = pollResponse and pollResponse.data and pollResponse.data.command
-	if typeof(command) ~= "table" then
-		return
+	if typeof(command) ~= "table" or typeof(command.id) ~= "number" then
+		return true
 	end
 
 	bridgeState.status = "running " .. tostring(command.kind or "command")
@@ -1692,6 +2067,7 @@ local function bridgePollOnce()
 	end
 
 	reportBridgeHeartbeat()
+	return true
 end
 
 local function handleRequest(label, path, onSuccess)
@@ -1762,7 +2138,7 @@ end)
 
 pushButton.MouseButton1Click:Connect(function()
 	local ok, result = pcall(function()
-		return pushLocalTree(true)
+		return runExclusive("push", pushLocalTree, true, false)
 	end)
 
 	if not ok then
@@ -1772,7 +2148,7 @@ end)
 
 previewPullButton.MouseButton1Click:Connect(function()
 	local ok, result = pcall(function()
-		return syncFromStudio("preview", false)
+		return runExclusive("preview pull", syncFromStudio, "preview", false)
 	end)
 
 	if not ok then
@@ -1782,7 +2158,7 @@ end)
 
 applyPullButton.MouseButton1Click:Connect(function()
 	local ok, result = pcall(function()
-		return syncFromStudio("apply", false)
+		return runExclusive("apply pull", syncFromStudio, "apply", false)
 	end)
 
 	if not ok then
@@ -1792,7 +2168,7 @@ end)
 
 forcePullButton.MouseButton1Click:Connect(function()
 	local ok, result = pcall(function()
-		return syncFromStudio("apply", true)
+		return runExclusive("force pull", syncFromStudio, "apply", true)
 	end)
 
 	if not ok then
@@ -1802,7 +2178,7 @@ end)
 
 restoreStudioBackupButton.MouseButton1Click:Connect(function()
 	local ok, result = pcall(function()
-		return restoreStudioBackup(true)
+		return runExclusive("restore", restoreStudioBackup, true)
 	end)
 
 	if not ok then
@@ -1811,10 +2187,40 @@ restoreStudioBackupButton.MouseButton1Click:Connect(function()
 end)
 
 portBox.Text = tostring(readPort())
-task.spawn(function()
-	while true do
-		bridgePollOnce()
-		task.wait(1)
-	end
+
+local pluginUnloading = false
+plugin.Unloading:Connect(function()
+	pluginUnloading = true
 end)
+
+if RunService:IsRunning() then
+	-- Plugins also load into playtest DataModels. Edits there are thrown away
+	-- when the test stops, so never register them as a bridge target.
+	setStatus("Nyjo bridge is disabled during playtests. Stop the playtest to sync.")
+else
+	task.spawn(function()
+		local delaySeconds = POLL_INTERVAL_SECONDS
+		local wasConnected = nil
+		while not pluginUnloading do
+			local ok, connected = pcall(bridgePollOnce)
+			connected = ok and connected == true
+			if connected then
+				delaySeconds = POLL_INTERVAL_SECONDS
+			else
+				-- Back off while the server is down instead of hammering
+				-- HttpService (and the Output window) every second.
+				delaySeconds = math.min(delaySeconds * 2, MAX_POLL_BACKOFF_SECONDS)
+			end
+			if connected ~= wasConnected and operationInProgress == nil then
+				if connected then
+					setStatus("Connected to nyjo at " .. dashboardUrl())
+				elseif wasConnected ~= nil then
+					setStatus("Lost connection to nyjo at " .. dashboardUrl() .. "; retrying...\n\n" .. tostring(bridgeState.lastError or ""))
+				end
+			end
+			wasConnected = connected
+			task.wait(delaySeconds)
+		end
+	end)
+end
 widget.Enabled = false
