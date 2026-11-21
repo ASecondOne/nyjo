@@ -56,7 +56,8 @@ Implemented right now:
 - [x] Local-only HTTP API with basic tree/create/update/delete endpoints
 - [x] `GET /api/health` plus `GET /api/info` for version/capability reporting
 - [x] Browser dashboard served by the Rust process for control, status, and logs
-- [x] Studio plugin install into Vinegar local plugin folders
+- [x] Studio plugin install into TuxBlox (default) and Vinegar local plugin folders
+- [x] Guarded push: deletes off by default, soft-delete into NyjoTrash, mass-delete refusal, single undo step with rollback on error
 - [x] Studio preview and push from the plugin
 - [x] Studio plugin bridge polling for browser-queued commands
 - [x] Explicit Studio session targeting so multiple open places do not steal each other's commands

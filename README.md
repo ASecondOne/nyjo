@@ -15,7 +15,7 @@ It scans a Linux-friendly project folder, turns it into a Roblox-style instance 
 - Supports typed container directories for child-bearing non-script instances like parts, UI trees, value objects, and textures
 - Round-trips newer UI modifier data like `UIShadow` plus per-corner `UICorner` radii when Studio exposes those properties
 - Runs a local server and browser dashboard for status, logs, preview, and sync control
-- Installs a Roblox Studio plugin bridge for Linux/Vinegar-based Studio setups
+- Installs a Roblox Studio plugin bridge for TuxBlox (default) or Vinegar Studio setups on Linux
 - Supports Studio push plus Studio pull with preview/apply/force modes
 
 ## How It Works
@@ -42,15 +42,20 @@ To use `nyjo`, you currently need:
 - Rust and Cargo
 - A web browser
 - Roblox Studio on Linux if you want Studio sync
-- A Studio setup that matches the Vinegar plugin layout if you want `nyjo install` to auto-copy the plugin
+- Roblox Studio via [TuxBlox](https://tuxblox.net) (recommended) or Vinegar if you want `nyjo install` to auto-copy the plugin
 - Optional: `zsh` if you want the included shell install helpers and completions
 
 Important notes:
 
 - The local server binds to `127.0.0.1` by default.
-- The plugin installer currently looks for Vinegar-style Studio roots under:
-  - `~/.var/app/org.vinegarhq.Vinegar/data/vinegar/prefixes/studio/drive_c/users/*/AppData/Local/Roblox`
-- If that path is not found, `nyjo install` still packages the plugin file into `dist/Nyjo.lua`.
+- The plugin installer looks for Studio's `AppData/Local/Roblox/Plugins` folder in this order:
+  1. TuxBlox: `$TUXBLOX_PREFIX` or `${TUXBLOX_ROOT:-~/.tuxblox}/runtime`, then `pfx/drive_c/users/<you>/AppData/Local/Roblox/Plugins`.
+     TuxBlox links that in-drive folder to `~/.tuxblox/roblox` (or to `~/.local/share/roblox` with its experimental Linux-integration flag), so writing through the in-drive path always lands where Studio looks.
+     See <https://tuxblox.net/docs/advanced/files-and-folders>.
+  2. Vinegar (legacy): `~/.var/app/org.vinegarhq.Vinegar/data/vinegar/prefixes/studio/drive_c/users/*/AppData/Local/Roblox/Plugins`
+- Start Studio through TuxBlox at least once first so it creates those folders.
+- `nyjo install --plugins-dir <dir>` installs somewhere else; `--no-auto-install` only packages `dist/Nyjo.lua`.
+- The first time the plugin talks to `127.0.0.1`, Studio may ask you to allow HTTP requests for the plugin; allow it.
 
 ## Install
 
@@ -130,8 +135,8 @@ Then open Roblox Studio on Linux, load the Nyjo plugin, and use the browser dash
 
 - `nyjo init --root <path> [--force]`
   Creates a default Roblox-style project scaffold and `.nyjoignore`.
-- `nyjo install --output-dir <path> [--port <port>]`
-  Packages `Nyjo.lua` and tries to install it into Vinegar Studio plugin folders.
+- `nyjo install --output-dir <path> [--port <port>] [--plugins-dir <dir> | --no-auto-install]`
+  Packages `Nyjo.lua` and installs it into the TuxBlox (or Vinegar) Studio plugin folder.
 - `nyjo tree --root <path> [--json]`
   Prints the parsed instance tree.
 - `nyjo serve --root <path> [--port <port>]`
@@ -140,8 +145,8 @@ Then open Roblox Studio on Linux, load the Nyjo plugin, and use the browser dash
   Prints a quick project summary and class counts.
 - `nyjo places [--port <port>] [--json]`
   Lists connected Studio bridge sessions with place names, place ids, and session ids.
-- `nyjo push [--port <port>] [--place-id <id> | --session-id <id>] [--wait-ms <ms>] [--json]`
-  Queues a Studio push through the running local server and optionally waits for the result.
+- `nyjo push [--port <port>] [--allow-deletes] [--place-id <id> | --session-id <id>] [--wait-ms <ms>] [--json]`
+  Queues a Studio push through the running local server and optionally waits for the result. Exits non-zero if Studio reports a failure.
 - `nyjo pull [--port <port>] [--mode <preview|apply|force>] [--place-id <id> | --session-id <id>] [--wait-ms <ms>] [--json]`
   Queues a Studio pull through the running local server and optionally waits for the result.
 
@@ -278,6 +283,25 @@ You can also drive the same bridge from the CLI now:
 - `nyjo pull --mode preview --place-id 123456`
 - `nyjo pull --mode apply --session-id <session>`
 
+## Push Safety
+
+Pushing into Studio is guarded because an earlier version could delete large parts of a place:
+
+- The local tree is fetched and validated before anything happens; a parse error means no push.
+- A Studio backup (`.nyjo-backups/studio/…`) is saved before every push (30 kept).
+- The whole push is one undo step ("Nyjo Push"); if anything errors, the recording is cancelled and Studio rolls back.
+- **Nothing is removed by default.** Instances that Nyjo created earlier and that no longer exist locally are left in Studio and reported.
+- With `--allow-deletes` (or the dashboard checkbox) they are moved to `ServerStorage.NyjoTrash/<timestamp>` instead of being destroyed. A push that would remove more than 200 instances is refused outright.
+- Instances Nyjo never created (no `NyjoManagedBy` attribute) are never removed.
+- Pushes and pulls are refused during playtests.
+- Studio instance names that are not safe file names (`..`, `/`, leading `.`, control characters) are skipped on pull and reported.
+
+## Local Server Safety
+
+- Binds to `127.0.0.1` only, and rejects requests whose `Host` is not loopback (DNS rebinding) or that come from another website (`Origin` / `Sec-Fetch-Site`).
+- The file API refuses `.git/`, `.nyjo-backups/`, `..`, absolute paths and symlinks that leave the project; deletes take a local backup first.
+- All writes are atomic (temp file + rename) and serialised.
+
 ## Studio Plugin Bridge
 
 The Roblox Studio plugin is a local bridge, not the main source of truth. Its job is to:
@@ -297,9 +321,17 @@ The local files and local parser remain the core model.
 - Round-tripping is strongest for the currently supported file types and translated properties
 - Conflict handling exists, but full two-sided reconciliation is still a work in progress
 - `nyjo watch` and `nyjo diff` CLI commands are not implemented yet
-- Auto-install of the plugin currently targets Vinegar-style Linux Studio paths
+- Auto-install of the plugin targets TuxBlox and Vinegar; use `--plugins-dir` for anything else
 
 For a more detailed project status and roadmap, see [TASK.md](TASK.md).
+
+## Development
+
+```bash
+cargo clippy --all-targets -- -D warnings
+cargo test
+LUAU=/path/to/luau tests/lua/run.sh   # plugin push-engine tests against a mocked Roblox API
+```
 
 ## License
 
